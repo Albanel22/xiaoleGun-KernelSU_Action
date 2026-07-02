@@ -124,7 +124,7 @@ jobs:
         if [ ${{ env.ENABLE_GCC_ARM64 }} = true ]; then
             mkdir gcc-64
             wget -O gcc-aarch64.tar.gz https://github.com/kksk12306/KernelSU_Action_gauguinpro/releases/download/gcc/gcc-64.tar.gz
-            tar -C gcc-64/ -zxvf gcc-64.tar.gz --strip-components=0
+            tar -C gcc-64/ -zxvf gcc-64.tar.gz --strip-components=1
             echo "GCC_64=CROSS_COMPILE=$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin/aarch64-linux-android-" >> $GITHUB_ENV
         fi
 
