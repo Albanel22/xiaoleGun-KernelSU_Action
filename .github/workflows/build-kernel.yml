@@ -251,11 +251,11 @@ jobs:
         export KBUILD_BUILD_HOST=Github-Action
         export KBUILD_BUILD_USER=$(echo ${{ github.actor }} | tr A-Z a-z)
         if [ ! -z "${{ env.KSU_EXPECTED_SIZE }}" ] && [ ! -z "${{ env.KSU_EXPECTED_HASH }}" ]; then
-            export KSU_EXPECTED_SIZE=${{ env.KSU_EXPECTED_SIZE }}
-            export KSU_EXPECTED_HASH=${{ env.KSU_EXPECTED_HASH }}
+          export KSU_EXPECTED_SIZE=${{ env.KSU_EXPECTED_SIZE }}
+          export KSU_EXPECTED_HASH=${{ env.KSU_EXPECTED_HASH }}
         fi
-        make -j$(nproc --all) O=out ARCH=${{ env.ARCH }} CROSS_COMPILE=aarch64-linux-android- ${{ env.KERNEL_CONFIG }}
-        make -j$(nproc --all) O=out ARCH=${{ env.ARCH }} CROSS_COMPILE=aarch64-linux-android-
+        make -j$(nproc --all) O=out ARCH=${{ env.ARCH }} CROSS_COMPILE=/home/runner/work/KernelSU_Action_gauguinpro/KernelSU_Action_gauguinpro/kernel_workspace/gcc-64/bin/aarch64-linux-android- ${{ env.KERNEL_CONFIG }}
+        make -j$(nproc --all) O=out ARCH=${{ env.ARCH }} CROSS_COMPILE=/home/runner/work/KernelSU_Action_gauguinpro/KernelSU_Action_gauguinpro/kernel_workspace/gcc-64/bin/aarch64-linux-android-
 
     - name: Check a kernel output files
       run: |
