@@ -97,11 +97,12 @@ declare -A ALIASES=(
 
 # cfg_read FILE KEY -- first non-comment "KEY=value" or "KEY:value" line.
 cfg_read() {
-	local file=$1 key=$2
-	[ -f "$file" ] || return 0
-	sed -nE "s/\r$//; s/^[[:space:]]*${key}[[:space:]]*[=:][[:space:]]*(.*)$/\1/p" "$file" \
-		| head -n1 \
-		| sed -E 's/[[:space:]]+$//'
+    local file=$1 key=$2
+    [ -f "$file" ] || return 0
+
+    sed -nE "s/\r$//; s/^[[:space:]]*${key}[[:space:]]*[=:][[:space:]]*(.*)$/\1/p" "$file" \
+        | head -n1 \
+        | sed -E 's/[[:space:]]+$//'
 }
 
 resolve() {
