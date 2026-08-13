@@ -2,9 +2,21 @@ name: CI
 
 on:
   push:
-    paths: ['scripts/**', 'patches/**', '.github/workflows/**', 'config.env', 'config/**']
+    paths:
+      - 'scripts/**'
+      - 'patches/**'
+      - '.github/workflows/**'
+      - 'config.env'
+      - 'config/**'
+
   pull_request:
-    paths: ['scripts/**', 'patches/**', '.github/workflows/**', 'config.env', 'config/**']
+    paths:
+      - 'scripts/**'
+      - 'patches/**'
+      - '.github/workflows/**'
+      - 'config.env'
+      - 'config/**'
+
   workflow_dispatch:
 
 permissions:
@@ -14,6 +26,7 @@ jobs:
   lint:
     name: Lint scripts and workflows
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -32,33 +45,44 @@ jobs:
         run: |
           # Every profile must parse and pass validation without a real build.
           fail=0
+
           for f in config.env config/*.env; do
             [ -f "$f" ] || continue
+
             echo "::group::$f"
+
             if CONFIG_ENV="$f" bash scripts/config.sh >/dev/null; then
               echo "OK: $f"
             else
               echo "::error file=$f::config validation failed"
               fail=1
             fi
+
             echo "::endgroup::"
           done
+
           exit "$fail"
 
       - name: Check upstream endpoints are alive
         continue-on-error: true
         run: |
-          # Informational: these are the URLs a build depends on. A failure here
-          # means an upstream moved, which is worth knowing before someone's
-          # build breaks at minute 40.
+          # Informational: these are the URLs a build depends on.
+          # A failure here means an upstream moved, which is worth knowing
+          # before someone's build breaks later.
+
           status=0
+
           while read -r url; do
             [ -n "$url" ] || continue
-            code=$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 30 "$url" || echo 000)
+
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+              -L --max-time 30 "$url" || echo 000)
+
             if [ "$code" = "200" ]; then
               printf '  ok   %s\n' "$url"
             else
-              printf '  %-4s %s\n' "$code" "$url"; status=1
+              printf '  %-4s %s\n' "$code" "$url"
+              status=1
             fi
           done <<'URLS'
           https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh
@@ -70,4 +94,5 @@ jobs:
           https://gitlab.com/simonpunk/susfs4ksu
           https://github.com/osm0sis/AnyKernel3
           URLS
+
           exit "$status"
