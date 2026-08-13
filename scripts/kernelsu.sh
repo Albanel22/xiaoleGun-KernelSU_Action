@@ -1,24 +1,22 @@
 #!/usr/bin/env bash
-# Install a KernelSU variant into the kernel tree.
 #
-# Every variant ships a near-identical kernel/setup.sh that clones itself next
-# to the kernel tree and symlinks drivers/kernelsu at it. They differ in three
-# ways that matter, all of which are encoded in the registry below:
+# Install and validate a KernelSU variant in the kernel tree.
 #
-#   * the directory the clone lands in (KernelSU vs KernelSU-Next),
-#   * what "no argument" means -- most check out the latest tag, ReSukiSU
-#     checks out main,
-#   * which ref carries non-GKI support and which carries SUSFS.
+# The installer is deliberately strict:
+#   1. resolve the requested/default ref
+#   2. validate the ref before calling setup.sh
+#   3. run the upstream variant setup.sh
+#   4. verify the resulting tree
+#   5. verify that the requested ref was actually checked out
+#   6. resolve the hook mode exactly once
+#   7. export all facts required by later build/patch steps
 #
-# The critical safety property: every variant's setup.sh ends its checkout with
-#     git checkout "$1" ... || echo "[-] Checkout default branch"
-# so an invalid ref does NOT fail the script -- it silently leaves the tree on
-# the default branch. A build asking for SukiSU's SUSFS-capable 'builtin'
-# branch and typing 'susfs-main' (which does not exist) would quietly produce a
-# kernel with no SUSFS at all. So we validate the ref before calling setup.sh
-# and verify the checkout afterwards.
+# setup.sh scripts used by KernelSU forks historically swallow an invalid
+# checkout ref and fall back to their default branch. Never rely on setup.sh
+# to validate a ref.
 
 set -euo pipefail
+
 # shellcheck source=scripts/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -26,246 +24,592 @@ KERNEL_DIR=${KERNEL_DIR:?KERNEL_DIR must point at the kernel source tree}
 
 # ------------------------------------------------------------- registry -----
 #
-# Fields, '|'-separated:
-#   1 repo URL
-#   2 ref the setup.sh script itself is fetched from
-#   3 directory setup.sh clones into, relative to the kernel tree
-#   4 default ref for modern (>= 5.10) kernels; empty means "let setup.sh pick"
-#   5 default ref for legacy (< 5.10) kernels
-#   6 refs that already contain SUSFS support (space separated; '-' for none)
-#   7 human-readable name
+# Fields:
+#   1 repository
+#   2 branch containing kernel/setup.sh
+#   3 directory created inside the kernel tree
+#   4 default ref for >= 5.10
+#   5 default ref for < 5.10
+#   6 refs known to bundle SUSFS
+#   7 display name
 #
-# Verified against each repo's live branch/tag list on 2026-07-27.
-
+# IMPORTANT:
+# setup_ref is the branch containing setup.sh.
+# install refs are independent of setup_ref.
+#
+# KernelSU-Next:
+#   setup.sh lives on "next"
+#   refs include dev/stable/legacy/specific tags.
+#
+# SukiSU-Ultra:
+#   setup.sh lives on "main"
+#   "main" is the GKI/main integration
+#   "builtin" is the non-GKI/source-integrated tree.
+#
 ksu_registry() {
-	case "$1" in
-	kernelsu)
-		# Official upstream. Dropped non-GKI support at v1.0, so legacy kernels
-		# are pinned to the last release that supports them.
-		echo "https://github.com/tiann/KernelSU|main|KernelSU||v0.9.5|-|KernelSU" ;;
-	kernelsu-next)
-		# 'next' was renamed to 'legacy' and the default branch is now 'dev'.
-		# Raw URLs containing /next/ only still work via GitHub's rename
-		# redirect, so we address the real branches directly.
-		echo "https://github.com/KernelSU-Next/KernelSU-Next|dev|KernelSU-Next|dev|legacy|-|KernelSU-Next" ;;
-	sukisu-ultra)
-		# Repo moved from the personal ShirkNeko account into its own org.
-		# 'main' is the modular v4 tree (KPM, no SUSFS); 'builtin' is the
-		# non-GKI/source-integrated tree and is the only one with SUSFS Kconfig.
-		echo "https://github.com/SukiSU-Ultra/SukiSU-Ultra|main|KernelSU|main|builtin|builtin|SukiSU-Ultra" ;;
-	resukisu)
-		# Re-fork of SukiSU-Ultra aimed at legacy/non-GKI kernels.
-		echo "https://github.com/ReSukiSU/ReSukiSU|main|KernelSU|main|main|-|ReSukiSU" ;;
-	rsuntk)
-		echo "https://github.com/rsuntk/KernelSU|main|KernelSU|main|main|susfs-rksu-master|RKSU (rsuntk)" ;;
-	backslashxx)
-		echo "https://github.com/backslashxx/KernelSU|master|KernelSU|master|master|-|backslashxx KernelSU" ;;
-	*)
-		die "unknown KSU_VARIANT '$1'" ;;
+	local variant=$1
+
+	case "$variant" in
+		kernelsu)
+			printf '%s\n' \
+				"https://github.com/tiann/KernelSU|main|KernelSU||v0.9.5|-|KernelSU"
+			;;
+
+		kernelsu-next)
+			printf '%s\n' \
+				"https://github.com/KernelSU-Next/KernelSU-Next|next|KernelSU|dev|legacy|-|KernelSU-Next"
+			;;
+
+		sukisu-ultra)
+			printf '%s\n' \
+				"https://github.com/SukiSU-Ultra/SukiSU-Ultra|main|KernelSU|main|builtin|builtin|SukiSU-Ultra"
+			;;
+
+		resukisu)
+			printf '%s\n' \
+				"https://github.com/ReSukiSU/ReSukiSU|main|KernelSU|main|main|-|ReSukiSU"
+			;;
+
+		rsuntk)
+			printf '%s\n' \
+				"https://github.com/rsuntk/KernelSU|main|KernelSU|main|main|susfs-rksu-master|RKSU (rsuntk)"
+			;;
+
+		backslashxx)
+			printf '%s\n' \
+				"https://github.com/backslashxx/KernelSU|master|KernelSU|master|master|-|backslashxx KernelSU"
+			;;
+
+		*)
+			die "unknown KSU_VARIANT '${variant}'"
+			;;
 	esac
 }
 
-ksu_field() { ksu_registry "$1" | cut -d'|' -f"$2"; }
+ksu_field() {
+	ksu_registry "$1" | cut -d'|' -f"$2"
+}
 
-# ReSukiSU's setup.sh checks out 'main' when given no argument, while every
-# other variant checks out the latest tag. Call that out so an unpinned CI
-# build is not silently tracking a moving branch.
-ksu_default_is_branch() { [ "$1" = "resukisu" ]; }
+# ------------------------------------------------------------- ref helpers ---
 
-# ---------------------------------------------------------------- install ---
+ksu_list_refs() {
+	local repo=$1
 
-ksu_install() {
-	local variant=$1 requested_ref=${2-}
+	git ls-remote \
+		--heads \
+		--tags \
+		"$repo" 2>/dev/null |
+		awk '
+			{
+				ref=$2
+				sub(/^refs\/heads\//, "", ref)
+				sub(/^refs\/tags\//, "", ref)
+				sub(/\^\{\}$/, "", ref)
+				print ref
+			}
+		' |
+		sort -u |
+		grep -v '^$' |
+		tr '\n' ' ' || true
+}
 
-	[ "$variant" = "none" ] && { info "KernelSU integration disabled"; return 0; }
+ksu_ref_exists() {
+	local repo=$1
+	local ref=$2
 
-	local repo setup_ref dir modern_ref legacy_ref susfs_refs name
-	IFS='|' read -r repo setup_ref dir modern_ref legacy_ref susfs_refs name <<<"$(ksu_registry "$variant")"
+	[ -n "$ref" ] || return 1
 
-	group "Installing ${name}"
-	info "repository: ${repo}"
-
-	# Decide which ref to check out.
-	local kver ref=$requested_ref
-	kver=$(kernel_version "$KERNEL_DIR" || echo "0.0")
-	if [ -z "$ref" ]; then
-		if ver_ge "$kver" "5.10"; then
-			ref=$modern_ref
-		else
-			ref=$legacy_ref
-			[ -n "$ref" ] && info "kernel ${kver} is pre-GKI; defaulting to ref '${ref}'"
-		fi
+	# First use the common helper.
+	if ref_exists "$repo" "$ref"; then
+		return 0
 	fi
 
-	# Validate before handing the ref to setup.sh, which would swallow a typo.
-	if [ -n "$ref" ]; then
-		info "validating ref '${ref}' exists in ${repo}"
-		ref_exists "$repo" "$ref" \
-			|| die "ref '${ref}' does not exist in ${repo}.
-       setup.sh would silently fall back to the default branch and you would
-       get a kernel without the feature you asked for.
-       Available branches: $(git ls-remote --heads "$repo" 2>/dev/null | awk '{print $2}' | sed 's@refs/heads/@@' | grep -v dependabot | tr '\n' ' ')"
-		ok "ref '${ref}' exists"
+	# Some annotated tags are exposed as refs/tags/name^{}.
+	# Explicitly test both heads and tags as a fallback.
+	if git ls-remote \
+		--exit-code \
+		--heads \
+		--tags \
+		"$repo" \
+		"refs/heads/${ref}" \
+		"refs/tags/${ref}" \
+		"refs/tags/${ref}^{}" \
+		>/dev/null 2>&1; then
+		return 0
+	fi
+
+	# Full/short commit SHA.
+	if printf '%s' "$ref" | grep -qE '^[0-9a-fA-F]{7,40}$'; then
+		return 0
+	fi
+
+	return 1
+}
+
+# ------------------------------------------------------------- defaults ------
+
+ksu_default_ref() {
+	local variant=$1
+	local kver=$2
+	local modern_ref legacy_ref
+
+	modern_ref=$(ksu_field "$variant" 4)
+	legacy_ref=$(ksu_field "$variant" 5)
+
+	if ver_ge "$kver" "5.10"; then
+		printf '%s' "$modern_ref"
 	else
-		warn "no ref pinned; setup.sh will pick the latest tag. Set KSU_REF for reproducible builds."
+		printf '%s' "$legacy_ref"
+	fi
+}
+
+# ReSukiSU defaults to its moving main branch rather than a release tag.
+ksu_default_is_branch() {
+	[ "$1" = "resukisu" ]
+}
+
+# ------------------------------------------------------------- installation ---
+
+ksu_install() {
+	local variant=$1
+	local requested_ref=${2-}
+
+	[ "$variant" = "none" ] && {
+		info "KernelSU integration disabled"
+		return 0
+	}
+
+	local repo setup_ref dir modern_ref legacy_ref susfs_refs name
+	IFS='|' read -r \
+		repo \
+		setup_ref \
+		dir \
+		modern_ref \
+		legacy_ref \
+		susfs_refs \
+		name <<<"$(ksu_registry "$variant")"
+
+	group "Installing ${name}"
+
+	info "repository: ${repo}"
+	info "setup.sh ref: ${setup_ref}"
+
+	# --------------------------------------------------------- kernel version
+
+	local kver
+	kver=$(kernel_version "$KERNEL_DIR") \
+		|| die "cannot determine kernel version from ${KERNEL_DIR}/Makefile"
+
+	info "detected kernel version: ${kver}"
+
+	# -------------------------------------------------------------- resolve ref
+
+	local ref=$requested_ref
+
+	if [ -z "$ref" ]; then
+		ref=$(ksu_default_ref "$variant" "$kver")
+	fi
+
+	if [ -z "$ref" ]; then
+		warn "no install ref selected for ${name}"
+		warn "setup.sh will choose its own default"
+	else
+		info "requested KernelSU ref: ${ref}"
+	fi
+
+	# ------------------------------------------------------------- validate ref
+
+	if [ -n "$ref" ]; then
+		info "validating ref '${ref}' in ${repo}"
+
+		if ! ksu_ref_exists "$repo" "$ref"; then
+			die "ref '${ref}' does not exist in ${repo}.
+   setup.sh would otherwise be able to silently fall back to its default.
+   Available refs:
+   $(ksu_list_refs "$repo")"
+		fi
+
+		ok "ref '${ref}' exists in ${repo}"
+	else
+		warn "no ref pinned; build is not fully reproducible"
 	fi
 
 	if [ -z "$requested_ref" ] && ksu_default_is_branch "$variant"; then
-		warn "${name}'s setup.sh defaults to the moving 'main' branch rather than a tag."
-		warn "Pin KSU_REF (e.g. a tag) if you need reproducible builds."
+		warn "${name} defaults to the moving 'main' branch"
+		warn "Set KSU_REF explicitly for reproducible builds"
 	fi
 
-	# Run the variant's own installer.
-	local setup_url="https://raw.githubusercontent.com/${repo#https://github.com/}/${setup_ref}/kernel/setup.sh"
-	info "running ${setup_url}"
+	# ------------------------------------------------------------ setup URL
+
+	local setup_url
+	setup_url="https://raw.githubusercontent.com/${repo#https://github.com/}/${setup_ref}/kernel/setup.sh"
+
+	info "setup script: ${setup_url}"
+
+	# ---------------------------------------------------------- run setup.sh
+
 	(
 		cd "$KERNEL_DIR"
+
 		if [ -n "$ref" ]; then
-			fetch_stdout "$setup_url" | bash -s "$ref"
+			fetch_stdout "$setup_url" | bash -s -- "$ref"
 		else
 			fetch_stdout "$setup_url" | bash
 		fi
 	) || die "${name} setup.sh failed"
 
-	# --- verify the installer actually did what it claims ------------------
+	# ------------------------------------------------------- verify directory
+
 	local ksu_dir="${KERNEL_DIR}/${dir}"
-	[ -d "$ksu_dir" ] || die "${name} setup.sh finished but ${dir}/ is missing"
+
+	[ -d "$ksu_dir" ] \
+		|| die "${name} setup.sh finished but '${dir}/' is missing"
 
 	local link="${KERNEL_DIR}/drivers/kernelsu"
-	[ -e "$link" ] || die "drivers/kernelsu symlink was not created"
 
-	# setup.sh only checks whether the word "kernelsu" already appears.  Some
-	# vendor trees carry an obsolete line guarded by CONFIG_WITH_KERNEL_SU, so
-	# setup.sh reports success without adding the CONFIG_KSU rule and the final
-	# link fails with every ksu_handle_* symbol undefined.  Normalize any stale
-	# rule to the symbol declared by the installed Kconfig.
+	[ -e "$link" ] \
+		|| die "drivers/kernelsu was not created"
+
+	# ------------------------------------------------------- verify symlink
+
+	if [ -L "$link" ]; then
+		local link_target
+		link_target=$(readlink "$link")
+
+		debug "drivers/kernelsu -> ${link_target}"
+
+		if [ ! -e "$link" ]; then
+			die "drivers/kernelsu is a broken symlink"
+		fi
+	else
+		warn "drivers/kernelsu is not a symlink; setup.sh created a directory/file"
+	fi
+
+	# ------------------------------------------------------ drivers Makefile
+
 	local driver_makefile="${KERNEL_DIR}/drivers/Makefile"
-	if ! grep -qE '^[[:space:]]*obj-\$\(CONFIG_KSU\)[[:space:]]*\+=[[:space:]]*kernelsu/?[[:space:]]*$' "$driver_makefile"; then
-		if grep -qE '^[[:space:]]*obj-\$\(CONFIG_[A-Z0-9_]+\)[[:space:]]*\+=[[:space:]]*kernelsu/?[[:space:]]*$' "$driver_makefile"; then
-			sed -i -E 's@^[[:space:]]*obj-\$\(CONFIG_[A-Z0-9_]+\)[[:space:]]*\+=[[:space:]]*kernelsu/?[[:space:]]*$@obj-$(CONFIG_KSU) += kernelsu/@' "$driver_makefile"
-			warn "normalized stale drivers/Makefile KernelSU guard to CONFIG_KSU"
+
+	[ -f "$driver_makefile" ] \
+		|| die "drivers/Makefile not found"
+
+	if ! grep -qE \
+		'^[[:space:]]*obj-\$\(CONFIG_KSU\)[[:space:]]*\+=[[:space:]]*kernelsu/?[[:space:]]*$' \
+		"$driver_makefile"; then
+
+		if grep -qE \
+			'^[[:space:]]*obj-\$\(CONFIG_[A-Z0-9_]+\)[[:space:]]*\+=[[:space:]]*kernelsu/?[[:space:]]*$' \
+			"$driver_makefile"; then
+
+			sed -i -E \
+				's@^[[:space:]]*obj-\$\(CONFIG_[A-Z0-9_]+\)[[:space:]]*\+=[[:space:]]*kernelsu/?[[:space:]]*$@obj-$(CONFIG_KSU) += kernelsu/@' \
+				"$driver_makefile"
+
+			warn "normalized stale KernelSU Makefile guard to CONFIG_KSU"
 		else
-			printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >>"$driver_makefile"
+			printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' \
+				>>"$driver_makefile"
+
 			warn "added missing CONFIG_KSU rule to drivers/Makefile"
 		fi
 	fi
 
-	grep -qE '^[[:space:]]*obj-\$\(CONFIG_KSU\)[[:space:]]*\+=[[:space:]]*kernelsu/?[[:space:]]*$' "$driver_makefile" \
-		|| die "drivers/Makefile was not wired to CONFIG_KSU for kernelsu"
-	grep -q 'drivers/kernelsu/Kconfig' "${KERNEL_DIR}/drivers/Kconfig" \
-		|| die "drivers/Kconfig was not wired up for kernelsu"
+	grep -qE \
+		'^[[:space:]]*obj-\$\(CONFIG_KSU\)[[:space:]]*\+=[[:space:]]*kernelsu/?[[:space:]]*$' \
+		"$driver_makefile" \
+		|| die "drivers/Makefile is not wired to CONFIG_KSU"
 
-	# Confirm we landed on the ref we asked for, catching the silent fallback.
-	local head_desc head_sha
-	head_sha=$(git -C "$ksu_dir" rev-parse --short HEAD)
-	head_desc=$(git -C "$ksu_dir" describe --tags --always 2>/dev/null || echo "$head_sha")
+	# ----------------------------------------------------------- drivers/Kconfig
+
+	local drivers_kconfig="${KERNEL_DIR}/drivers/Kconfig"
+
+	[ -f "$drivers_kconfig" ] \
+		|| die "drivers/Kconfig not found"
+
+	if ! grep -q 'drivers/kernelsu/Kconfig' "$drivers_kconfig"; then
+		die "drivers/Kconfig is not wired to drivers/kernelsu/Kconfig"
+	fi
+
+	# ----------------------------------------------------------- KSU Kconfig
+
+	local ksu_kconfig="${ksu_dir}/Kconfig"
+
+	[ -f "$ksu_kconfig" ] \
+		|| die "${name} Kconfig missing: ${ksu_kconfig}"
+
+	grep -qE '^[[:space:]]*(menu|config)[[:space:]].*KSU|config[[:space:]]+KSU' \
+		"$ksu_kconfig" 2>/dev/null \
+		|| warn "could not find an obvious KSU config declaration in ${ksu_kconfig}"
+
+	# --------------------------------------------------------- actual checkout
+
+	local head_sha
+	local head_full_sha
+	local head_desc
+
+	head_full_sha=$(git -C "$ksu_dir" rev-parse HEAD 2>/dev/null) \
+		|| die "cannot determine ${name} checkout commit"
+
+	head_sha=${head_full_sha:0:12}
+
+	head_desc=$(git -C "$ksu_dir" describe --tags --always 2>/dev/null \
+		|| printf '%s' "$head_sha")
+
+	info "${name} checkout: ${head_desc} (${head_sha})"
+
+	# ----------------------------------------------------------- verify ref
+
 	if [ -n "$ref" ]; then
-		local want
-		want=$(git -C "$ksu_dir" rev-parse --verify --quiet "$ref^{commit}" 2>/dev/null || true)
-		if [ -n "$want" ] && [ "$want" != "$(git -C "$ksu_dir" rev-parse HEAD)" ]; then
-			die "${name} is checked out at ${head_desc}, not the requested ref '${ref}'"
+		local wanted_sha=""
+		local actual_sha="$head_full_sha"
+
+		# Resolve the requested ref locally first.
+		wanted_sha=$(
+			git -C "$ksu_dir" rev-parse --verify --quiet "${ref}^{commit}" \
+			2>/dev/null || true
+		)
+
+		# If it was not available locally, fetch the exact ref from origin.
+		if [ -z "$wanted_sha" ]; then
+			git -C "$ksu_dir" fetch -q --no-tags origin \
+				"+refs/heads/${ref}:refs/remotes/origin/${ref}" \
+				2>/dev/null || true
+
+			wanted_sha=$(
+				git -C "$ksu_dir" rev-parse --verify --quiet \
+					"refs/remotes/origin/${ref}^{commit}" \
+					2>/dev/null || true
+			)
+		fi
+
+		if [ -n "$wanted_sha" ]; then
+			if [ "$wanted_sha" != "$actual_sha" ]; then
+				die "${name} checkout mismatch:
+   requested ref : ${ref}
+   requested SHA : ${wanted_sha}
+   actual SHA    : ${actual_sha}
+   actual commit : ${head_desc}"
+			fi
+
+			ok "${name} checkout matches requested ref '${ref}'"
+		else
+			warn "could not resolve '${ref}' locally after setup.sh"
+			warn "actual checkout: ${head_desc} (${head_sha})"
+			warn "continuing because this may be a detached commit/SHA"
 		fi
 	fi
-	ok "${name} installed at ${head_desc} (${head_sha})"
 
-	# --- publish facts the later steps need --------------------------------
-	local count version_label
-	count=$(git -C "$ksu_dir" rev-list --count HEAD 2>/dev/null || echo 0)
+	# -------------------------------------------------------- CONFIG_KSU check
+
+	if grep -RqsE \
+		'^[[:space:]]*config[[:space:]]+KSU([[:space:]]|$)' \
+		"$ksu_dir"; then
+		ok "KernelSU Kconfig declares CONFIG_KSU"
+	else
+		die "${name} installation does not declare CONFIG_KSU"
+	fi
+
+	# ----------------------------------------------------------- git metadata
+
+	local count
+	local version_label
+
+	count=$(git -C "$ksu_dir" rev-list --count HEAD 2>/dev/null || printf '0')
+
 	if git -C "$ksu_dir" describe --exact-match --tags >/dev/null 2>&1; then
 		version_label=$(git -C "$ksu_dir" describe --exact-match --tags)
 	else
 		version_label="${ref:-HEAD}-${head_sha}"
 	fi
 
+	# ------------------------------------------------------------- exports
+
 	export_env KSU_DIR "$dir"
 	export_env KSU_NAME "$name"
-	export_env KSU_REF_RESOLVED "${ref:-<latest-tag>}"
+	export_env KSU_REF_RESOLVED "${ref:-<setup.sh-default>}"
 	export_env KSU_VERSION_LABEL "$version_label"
+	export_env KSU_COMMIT "$head_full_sha"
+	export_env KSU_COMMIT_SHORT "$head_sha"
 	export_env KSU_COMMIT_COUNT "$count"
 	export_env KSU_SUSFS_BUNDLED_REFS "$susfs_refs"
+
 	export_env UPLOADNAME "-${name// /_}_${version_label}"
 
-	ksu_resolve_hook_mode "${KSU_HOOK_MODE:-auto}" "$kver"
+	# --------------------------------------------------------- hook resolution
+
+	ksu_resolve_hook_mode \
+		"${KSU_HOOK_MODE:-auto}" \
+		"$kver"
+
+	# -------------------------------------------------------------- summary
 
 	summary "| KernelSU variant | \`${name}\` |"
-	summary "| KernelSU ref | \`${ref:-latest tag}\` -> \`${version_label}\` |"
+	summary "| KernelSU setup ref | \`${setup_ref}\` |"
+	summary "| KernelSU install ref | \`${ref:-setup.sh default}\` |"
+	summary "| KernelSU commit | \`${head_sha}\` |"
+	summary "| KernelSU version | \`${version_label}\` |"
+	summary "| KernelSU hooks | \`${KSU_HOOK_MODE_RESOLVED:-unknown}\` |"
 
+	ok "${name} installed successfully"
 	endgroup
 }
 
-# ------------------------------------------------------------ hook config ---
-#
-# Which hook mechanism a variant should use is genuinely version- and
-# fork-specific. 'auto' picks the option that the variant actually declares.
+# ------------------------------------------------------------ hook config ----
 
-# Resolve 'auto' into a concrete mode and publish it.
 #
-# This has to happen once, early, and be reused by BOTH the source-patching
-# step and the defconfig step. Resolving it independently in each place is how
-# you end up setting CONFIG_KSU_MANUAL_HOOK on a tree whose syscall entry
-# points were never actually patched -- which builds fine and then does
-# nothing at runtime.
+# Resolve "auto" exactly once.
+#
+# GKI / modern kernels:
+#   kprobes
+#
+# pre-GKI / legacy kernels:
+#   manual
+#
+# This resolved value is exported and reused by patches.sh AND defconfig.sh.
+
 ksu_resolve_hook_mode() {
-	local mode=${1:-auto} kver=$2
-	if [ "$mode" = "auto" ]; then
-		if ver_ge "$kver" "5.10"; then
-			mode="kprobes"
-		else
-			# kprobes on pre-GKI kernels is the classic source of "KernelSU
-			# installed but su does nothing" reports; manual hooks are patched
-			# straight into the syscall entry points instead.
-			mode="manual"
-		fi
-		info "hook mode 'auto' resolved to '${mode}' for kernel ${kver}"
-	fi
+	local mode=${1:-auto}
+	local kver=$2
+
+	case "$mode" in
+		auto)
+			if ver_ge "$kver" "5.10"; then
+				mode="kprobes"
+			else
+				mode="manual"
+			fi
+
+			info "hook mode 'auto' resolved to '${mode}' for kernel ${kver}"
+			;;
+
+		kprobes|manual|tracepoint|syscall|none)
+			;;
+
+		*)
+			die "invalid KSU_HOOK_MODE '${mode}'"
+			;;
+	esac
+
 	export_env KSU_HOOK_MODE_RESOLVED "$mode"
 }
 
 ksu_hook_configs() {
-	local variant=$1 mode=$2 defconfig=$3 kver=$4
+	local variant=$1
+	local mode=$2
+	local defconfig=$3
+	local kver=$4
 
 	if [ "$mode" = "auto" ]; then
-		[ -n "${KSU_HOOK_MODE_RESOLVED:-}" ] || ksu_resolve_hook_mode "$mode" "$kver"
-		mode=$KSU_HOOK_MODE_RESOLVED
+		if [ -n "${KSU_HOOK_MODE_RESOLVED:-}" ]; then
+			mode="$KSU_HOOK_MODE_RESOLVED"
+		else
+			ksu_resolve_hook_mode "$mode" "$kver"
+			mode="$KSU_HOOK_MODE_RESOLVED"
+		fi
 	fi
 
 	case "$mode" in
-	none) return 0 ;;
-	kprobes)
-		kconf_enable "$defconfig" CONFIG_MODULES
-		kconf_enable "$defconfig" CONFIG_KPROBES
-		kconf_enable "$defconfig" CONFIG_HAVE_KPROBES
-		kconf_enable "$defconfig" CONFIG_KPROBE_EVENTS
-		kconf_enable "$defconfig" CONFIG_KRETPROBES
-		[ "$variant" = "kernelsu-next" ] && kconf_enable "$defconfig" CONFIG_KSU_KPROBES_HOOK
-		;;
-	manual)
-		case "$variant" in
-			kernelsu-next)  kconf_enable "$defconfig" CONFIG_KSU_MANUAL_HOOK ;;
-			sukisu-ultra)
-				kconf_enable "$defconfig" CONFIG_KSU_MANUAL_HOOK ;;
-			resukisu)
-				# ReSukiSU's non-GKI static export check requires the complete
-				# kallsyms table unless every internal SELinux symbol is exported
-				# manually by the vendor tree.
-				kconf_set_many "$defconfig" \
-					CONFIG_KSU_MANUAL_HOOK=y CONFIG_DEBUG_KERNEL=y \
-					CONFIG_KALLSYMS=y CONFIG_KALLSYMS_ALL=y ;;
-			*) : ;;  # tiann/KernelSU 0.9.x infers manual hooks from the source patch
-		esac
-		;;
-	tracepoint)
-		[ "$variant" = "resukisu" ] || [ "$variant" = "sukisu-ultra" ] \
-			|| warn "hook mode 'tracepoint' is only declared by ReSukiSU/SukiSU-Ultra; ignoring for ${variant}"
-		kconf_enable "$defconfig" CONFIG_KSU_TRACEPOINT_HOOK
-		;;
-	syscall)
-		kconf_enable "$defconfig" CONFIG_KSU_SYSCALL_HOOK
-		;;
+		none)
+			info "KernelSU hook configuration disabled"
+			return 0
+			;;
+
+		kprobes)
+			kconf_enable "$defconfig" CONFIG_MODULES
+			kconf_enable "$defconfig" CONFIG_KPROBES
+			kconf_enable "$defconfig" CONFIG_KPROBE_EVENTS
+			kconf_enable "$defconfig" CONFIG_KRETPROBES
+
+			case "$variant" in
+				kernelsu-next)
+					# Current KernelSU-Next documentation uses
+					# CONFIG_KSU_KPROBE_HOOKS.
+					kconf_enable "$defconfig" CONFIG_KSU_KPROBE_HOOKS
+
+					# Older trees used the singular form. Only add it
+					# when the installed Kconfig actually declares it.
+					if grep -Rqs \
+						'config KSU_KPROBES_HOOK' \
+						"${KERNEL_DIR:-.}/drivers/kernelsu" 2>/dev/null; then
+						kconf_enable "$defconfig" CONFIG_KSU_KPROBES_HOOK
+					fi
+					;;
+
+				sukisu-ultra|resukisu|rsuntk|backslashxx)
+					# These variants may declare their own Kprobe option.
+					# CONFIG_KPROBES itself is the mandatory kernel side.
+					;;
+
+				*)
+					;;
+			esac
+			;;
+
+		manual)
+			case "$variant" in
+				kernelsu-next)
+					kconf_enable "$defconfig" CONFIG_KSU_MANUAL_HOOK
+					;;
+
+				sukisu-ultra)
+					kconf_enable "$defconfig" CONFIG_KSU_MANUAL_HOOK
+					;;
+
+				resukisu)
+					kconf_set_many "$defconfig" \
+						CONFIG_KSU_MANUAL_HOOK=y \
+						CONFIG_DEBUG_KERNEL=y \
+						CONFIG_KALLSYMS=y \
+						CONFIG_KALLSYMS_ALL=y
+					;;
+
+				rsuntk)
+					# RKSU legacy integration generally relies on the
+					# source hooks rather than the modern Kprobe path.
+					;;
+
+				backslashxx)
+					# backslashxx hooks are applied by patches.sh.
+					;;
+
+				*)
+					# Official KernelSU 0.9.x legacy integration gets its
+					# hooks from the source patch.
+					;;
+			esac
+			;;
+
+		tracepoint)
+			case "$variant" in
+				resukisu|sukisu-ultra)
+					kconf_enable "$defconfig" CONFIG_KSU_TRACEPOINT_HOOK
+					;;
+
+				*)
+					warn "tracepoint hooks are not declared by ${variant}; leaving mode unchanged"
+					;;
+			esac
+			;;
+
+		syscall)
+			if grep -Rqs \
+				'config KSU_SYSCALL_HOOK' \
+				"${KERNEL_DIR:-.}/drivers/kernelsu" 2>/dev/null; then
+				kconf_enable "$defconfig" CONFIG_KSU_SYSCALL_HOOK
+			else
+				warn "${variant} does not declare CONFIG_KSU_SYSCALL_HOOK"
+			fi
+			;;
+
+		*)
+			die "internal error: unsupported resolved hook mode '${mode}'"
+			;;
 	esac
 }
 
-# Only run the installer when sourced as a script entry point.
+# ------------------------------------------------------------------- main -----
+
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
-	ksu_install "${KSU_VARIANT:-none}" "${KSU_REF:-}"
+	ksu_install \
+		"${KSU_VARIANT:-none}" \
+		"${KSU_REF:-}"
 fi
