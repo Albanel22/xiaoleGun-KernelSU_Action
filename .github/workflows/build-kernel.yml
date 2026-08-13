@@ -2,18 +2,13 @@ name: Build Kernel
 
 on:
   workflow_dispatch:
-    # GitHub allows at most 10 workflow_dispatch inputs, so these are the knobs
-    # worth changing per-run. Everything else lives in the config file selected
-    # by `config`, so a fork can keep one profile per device.
     inputs:
       config:
         description: "Config file to build (path, relative to the repo root)"
         required: false
         default: "config.env"
         type: string
-      # "config" on the options below means "use whatever the config file says".
-      # It is the default so that running the form without touching anything
-      # reproduces exactly what your profile describes.
+
       ksu_variant:
         description: "KernelSU variant"
         required: false
@@ -28,46 +23,73 @@ on:
           - resukisu
           - rsuntk
           - backslashxx
+
       ksu_ref:
         description: "KernelSU branch/tag/commit (blank = best default for your kernel)"
         required: false
         default: ""
         type: string
+
       hook_mode:
         description: "Syscall hook mechanism"
         required: false
         default: "config"
         type: choice
-        options: [config, auto, kprobes, manual, tracepoint, syscall, none]
+        options:
+          - config
+          - auto
+          - kprobes
+          - manual
+          - tracepoint
+          - syscall
+          - none
+
       susfs:
         description: "Apply SUSFS (mount/root hiding)"
         required: false
         default: "config"
         type: choice
-        options: [config, "true", "false"]
+        options:
+          - config
+          - "true"
+          - "false"
+
       path_umount:
         description: "Backport path_umount() (needed on kernels older than 5.9)"
         required: false
         default: "config"
         type: choice
-        options: [config, "true", "false"]
+        options:
+          - config
+          - "true"
+          - "false"
+
       hide_stuff:
         description: "Apply hide_stuff (extra fingerprint removal)"
         required: false
         default: "config"
         type: choice
-        options: [config, "true", "false"]
+        options:
+          - config
+          - "true"
+          - "false"
+
       kpm:
         description: "Enable KPM (SukiSU-Ultra only)"
         required: false
         default: "config"
         type: choice
-        options: [config, "true", "false"]
+        options:
+          - config
+          - "true"
+          - "false"
+
       extra_defconfig:
         description: "Extra defconfig lines, space separated (e.g. CONFIG_TMPFS_XATTR=y)"
         required: false
         default: ""
         type: string
+
       publish_release:
         description: "Publish the build as a GitHub Release"
         required: false
@@ -76,20 +98,58 @@ on:
 
   workflow_call:
     inputs:
-      config:          { required: false, default: "config.env", type: string }
-      ksu_variant:     { required: false, default: "config",     type: string }
-      ksu_ref:         { required: false, default: "",           type: string }
-      hook_mode:       { required: false, default: "config",     type: string }
-      susfs:           { required: false, default: "config",     type: string }
-      path_umount:     { required: false, default: "config",     type: string }
-      hide_stuff:      { required: false, default: "config",     type: string }
-      kpm:             { required: false, default: "config",     type: string }
-      extra_defconfig: { required: false, default: "",           type: string }
-      publish_release: { required: false, default: false,        type: boolean }
+      config:
+        required: false
+        default: "config.env"
+        type: string
 
-# Only one build per ref at a time; a newer run supersedes an older one.
+      ksu_variant:
+        required: false
+        default: "config"
+        type: string
+
+      ksu_ref:
+        required: false
+        default: ""
+        type: string
+
+      hook_mode:
+        required: false
+        default: "config"
+        type: string
+
+      susfs:
+        required: false
+        default: "config"
+        type: string
+
+      path_umount:
+        required: false
+        default: "config"
+        type: string
+
+      hide_stuff:
+        required: false
+        default: "config"
+        type: string
+
+      kpm:
+        required: false
+        default: "config"
+        type: string
+
+      extra_defconfig:
+        required: false
+        default: ""
+        type: string
+
+      publish_release:
+        required: false
+        default: false
+        type: boolean
+
 concurrency:
-  group: build-kernel-${{ github.ref }}-${{ inputs.config }}
+  group: build-kernel-${{ github.workflow }}-${{ github.ref }}-${{ inputs.config }}
   cancel-in-progress: true
 
 permissions:
@@ -100,6 +160,7 @@ jobs:
     name: Build ${{ inputs.config }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
+
     outputs:
       device: ${{ steps.meta.outputs.device }}
       build_time: ${{ steps.meta.outputs.build_time }}
@@ -107,9 +168,11 @@ jobs:
       ksu_version: ${{ steps.meta.outputs.ksu_version }}
       kernel_release: ${{ steps.meta.outputs.kernel_release }}
       susfs_version: ${{ steps.meta.outputs.susfs_version }}
+
     env:
       WORKSPACE: ${{ github.workspace }}/kernel_workspace
       CONFIG_ENV: ${{ inputs.config }}
+
       CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
       CCACHE_NOHASHDIR: "true"
       CCACHE_HARDLINK: "true"
@@ -125,14 +188,25 @@ jobs:
       IN_EXTRA_DEFCONFIG: ${{ inputs.extra_defconfig }}
 
     steps:
-      - uses: actions/checkout@v4
+      # ---------------------------------------------------------------
+      # SOURCE
+      # ---------------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Resolve configuration
-        run: bash scripts/config.sh
+        run: |
+          set -euo pipefail
+          bash scripts/config.sh
+
+      # ---------------------------------------------------------------
+      # RUNNER
+      # ---------------------------------------------------------------
 
       - name: Free up disk space
         if: env.REMOVE_UNUSED_PACKAGES == 'true'
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
         with:
           tool-cache: true
           android: false
@@ -144,39 +218,94 @@ jobs:
 
       - name: Add swap space
         run: |
-          # LTO links are memory-hungry and the runner has 16GB; a swap file is
-          # cheaper and more predictable than an unpinned third-party action.
+          set -euo pipefail
+
+          if swapon --show | grep -q .; then
+            echo "Swap already enabled:"
+            swapon --show
+            exit 0
+          fi
+
           sudo fallocate -l 8G /mnt/swapfile
           sudo chmod 600 /mnt/swapfile
           sudo mkswap /mnt/swapfile
           sudo swapon /mnt/swapfile
+
+          echo "Memory:"
           free -h
+
+          echo "Swap:"
+          swapon --show
 
       - name: Install build dependencies
         run: |
+          set -euo pipefail
+
           sudo apt-get update -qq
-          # Kept deliberately lean. The historical list here was copied from the
-          # full AOSP platform build docs and pulled in ~40 packages a kernel
-          # build never touches, several of which no longer exist on current
-          # Ubuntu (python2, lib32ncurses5-dev, ...).
+
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ccache cpio curl device-tree-compiler flex \
-            git libelf-dev libssl-dev lz4 make python3 rsync unzip zip zstd \
-            libncurses-dev
+            bc \
+            bison \
+            build-essential \
+            ccache \
+            cpio \
+            curl \
+            device-tree-compiler \
+            flex \
+            git \
+            libelf-dev \
+            libncurses-dev \
+            libssl-dev \
+            lz4 \
+            make \
+            python3 \
+            rsync \
+            unzip \
+            zip \
+            zstd
+
           mkdir -p "$WORKSPACE"
 
+      # ---------------------------------------------------------------
+      # TOOLCHAIN
+      # ---------------------------------------------------------------
+
       - name: Set up toolchain
-        run: bash scripts/toolchain.sh
+        run: |
+          set -euo pipefail
+          bash scripts/toolchain.sh
+
+      # ---------------------------------------------------------------
+      # KERNEL SOURCE
+      # ---------------------------------------------------------------
 
       - name: Fetch kernel source
-        run: bash scripts/source.sh
+        run: |
+          set -euo pipefail
+          bash scripts/source.sh
+
+      # ---------------------------------------------------------------
+      # KERNELSU
+      # ---------------------------------------------------------------
 
       - name: Install KernelSU
         if: env.KSU_VARIANT != 'none'
-        run: bash scripts/kernelsu.sh
+        run: |
+          set -euo pipefail
+          bash scripts/kernelsu.sh
+
+      # ---------------------------------------------------------------
+      # PATCHES
+      # ---------------------------------------------------------------
 
       - name: Apply kernel patches
-        run: bash scripts/patches.sh all
+        run: |
+          set -euo pipefail
+          bash scripts/patches.sh all
+
+      # ---------------------------------------------------------------
+      # CCACHE
+      # ---------------------------------------------------------------
 
       - name: Set up ccache
         if: env.ENABLE_CCACHE == 'true'
@@ -185,15 +314,63 @@ jobs:
           key: kernel-${{ env.DEVICE }}-${{ env.KSU_VARIANT }}-${{ env.KERNEL_VERSION }}
           max-size: 2G
 
+      - name: Show build environment
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo " Build environment"
+          echo "========================================"
+
+          echo "Device:          ${DEVICE}"
+          echo "Kernel source:   ${KERNEL_SOURCE}"
+          echo "Kernel branch:   ${KERNEL_SOURCE_BRANCH}"
+          echo "Kernel version:  ${KERNEL_VERSION}"
+          echo "Kernel config:   ${KERNEL_CONFIG}"
+          echo "Architecture:    ${ARCH}"
+          echo "KernelSU:        ${KSU_VARIANT}"
+          echo "KernelSU ref:    ${KSU_REF_RESOLVED:-}"
+          echo "Hook mode:       ${KSU_HOOK_MODE_RESOLVED:-${KSU_HOOK_MODE:-}}"
+          echo "SUSFS:           ${ENABLE_SUSFS}"
+          echo "KPM:             ${ENABLE_KPM}"
+          echo "LLVM:            ${USE_LLVM}"
+          echo "Clang:           ${CLANG_PATH:-system}"
+          echo "CCache:          ${ENABLE_CCACHE}"
+          echo "========================================"
+
+          if [ -n "${CLANG_PATH:-}" ] && [ -x "${CLANG_PATH}/clang" ]; then
+            "${CLANG_PATH}/clang" --version | head -n 2
+          fi
+
+          ccache --show-stats || true
+
+      # ---------------------------------------------------------------
+      # BUILD
+      # ---------------------------------------------------------------
+
       - name: Build kernel
-        run: bash scripts/build.sh all
+        run: |
+          set -euo pipefail
+          bash scripts/build.sh all
+
+      # ---------------------------------------------------------------
+      # PACKAGE
+      # ---------------------------------------------------------------
 
       - name: Package artifacts
-        run: bash scripts/package.sh all
+        run: |
+          set -euo pipefail
+          bash scripts/package.sh all
+
+      # ---------------------------------------------------------------
+      # METADATA
+      # ---------------------------------------------------------------
 
       - name: Export build metadata
         id: meta
         run: |
+          set -euo pipefail
+
           {
             echo "device=${DEVICE}"
             echo "build_time=${BUILD_TIME}"
@@ -203,43 +380,88 @@ jobs:
             echo "susfs_version=${SUSFS_VERSION:-}"
           } >> "$GITHUB_OUTPUT"
 
+      # ---------------------------------------------------------------
+      # ARTIFACTS
+      # ---------------------------------------------------------------
+
       - name: Upload kernel image
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.KERNEL_IMAGE_NAME }}${{ env.LOCALVERSION }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
-          path: kernel_workspace/android-kernel/out/arch/${{ env.ARCH }}/boot/${{ env.KERNEL_IMAGE_NAME }}
+          path: ${{ env.WORKSPACE }}/android-kernel/out/arch/${{ env.ARCH }}/boot/${{ env.KERNEL_IMAGE_NAME }}
           if-no-files-found: error
+          compression-level: 0
 
       - name: Upload AnyKernel3
         uses: actions/upload-artifact@v4
         with:
           name: AnyKernel3${{ env.LOCALVERSION }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
-          path: kernel_workspace/AnyKernel3/*
+          path: ${{ env.WORKSPACE }}/AnyKernel3/**
           if-no-files-found: error
+          compression-level: 0
 
       - name: Upload DTBO image
         if: env.CHECK_DTBO_IS_OK == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: dtbo-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
-          path: kernel_workspace/android-kernel/out/arch/${{ env.ARCH }}/boot/dtbo.img
+          path: ${{ env.WORKSPACE }}/android-kernel/out/arch/${{ env.ARCH }}/boot/dtbo.img
+          if-no-files-found: error
+          compression-level: 0
 
       - name: Upload boot image
         if: env.MAKE_BOOT_IMAGE_IS_OK == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: boot${{ env.LOCALVERSION }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
-          path: kernel_workspace/boot.img
+          path: ${{ env.WORKSPACE }}/boot.img
+          if-no-files-found: error
+          compression-level: 0
 
-  # Publishing is a separate job so the build itself runs with a read-only
-  # token; only this job gets contents:write, and only when asked for.
+      # ---------------------------------------------------------------
+      # BUILD SUMMARY
+      # ---------------------------------------------------------------
+
+      - name: Build summary
+        if: always()
+        run: |
+          {
+            echo "## Kernel build"
+            echo ""
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| Device | \`${DEVICE:-unknown}\` |"
+            echo "| Kernel | \`${KERNEL_SOURCE##*/:-unknown}\` |"
+            echo "| Kernel version | \`${KERNEL_VERSION:-unknown}\` |"
+            echo "| KernelSU | \`${KSU_NAME:-none}\` |"
+            echo "| KernelSU version | \`${KSU_VERSION_LABEL:-unknown}\` |"
+            echo "| SUSFS | \`${SUSFS_VERSION:-not applied}\` |"
+            echo "| Build time | \`${BUILD_TIME:-unknown}\` |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if command -v ccache >/dev/null 2>&1; then
+            echo "### ccache" >> "$GITHUB_STEP_SUMMARY"
+            echo '```text' >> "$GITHUB_STEP_SUMMARY"
+            ccache --show-stats >> "$GITHUB_STEP_SUMMARY" || true
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # =====================================================================
+  # RELEASE
+  # =====================================================================
+
   release:
     name: Publish release
     needs: build
-    if: inputs.publish_release
+
+    if: ${{ inputs.publish_release }}
+
     runs-on: ubuntu-latest
+
     permissions:
       contents: write
+
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -247,32 +469,94 @@ jobs:
           path: artifacts
           merge-multiple: false
 
-      - name: Package AnyKernel3 as a flashable zip
+      - name: Prepare release directory
         run: |
+          set -euo pipefail
+
           mkdir -p release
+
+          echo "Downloaded artifacts:"
+          find artifacts -maxdepth 3 -type f -print | sort
+
+      - name: Package AnyKernel3 as flashable zip
+        run: |
+          set -euo pipefail
+
           shopt -s nullglob
+
+          found=false
+
           for dir in artifacts/AnyKernel3*/; do
-            name=$(basename "${dir%/}")
-            (cd "$dir" && zip -qr9 "${GITHUB_WORKSPACE}/release/${name}.zip" .)
-            echo "packed ${name}.zip"
+            found=true
+
+            name="$(basename "${dir%/}")"
+
+            (
+              cd "$dir"
+              zip -qr9 \
+                "${GITHUB_WORKSPACE}/release/${name}.zip" \
+                .
+            )
+
+            echo "Packed ${name}.zip"
           done
-          for f in artifacts/*/Image* artifacts/*/boot.img artifacts/*/dtbo.img; do
-            [ -f "$f" ] && cp "$f" release/
+
+          if [ "$found" = false ]; then
+            echo "::error::No AnyKernel3 artifact was downloaded."
+            exit 1
+          fi
+
+      - name: Collect kernel artifacts
+        run: |
+          set -euo pipefail
+
+          shopt -s nullglob
+
+          for f in \
+            artifacts/*/Image \
+            artifacts/*/Image.gz \
+            artifacts/*/Image.gz-dtb \
+            artifacts/*/Image.lz4 \
+            artifacts/*/boot.img \
+            artifacts/*/dtbo.img; do
+
+            [ -f "$f" ] || continue
+
+            cp "$f" release/
           done
-          ls -la release/
+
+          echo "Release files:"
+          ls -lah release/
+
+          [ -n "$(find release -maxdepth 1 -type f -print -quit)" ] \
+            || {
+              echo "::error::No release artifacts found."
+              exit 1
+            }
 
       - name: Create release
-        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
+        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8
         with:
           tag_name: ${{ needs.build.outputs.device }}-${{ needs.build.outputs.build_time }}
           name: ${{ needs.build.outputs.device }} · ${{ needs.build.outputs.ksu_name }} · ${{ needs.build.outputs.build_time }}
           body: |
-            | | |
+            ## Kernel build
+
+            | Item | Value |
             | --- | --- |
             | Device | `${{ needs.build.outputs.device }}` |
             | Kernel | `${{ needs.build.outputs.kernel_release }}` |
-            | KernelSU | `${{ needs.build.outputs.ksu_name }}` @ `${{ needs.build.outputs.ksu_version }}` |
+            | KernelSU | `${{ needs.build.outputs.ksu_name }}` |
+            | KernelSU version | `${{ needs.build.outputs.ksu_version }}` |
             | SUSFS | `${{ needs.build.outputs.susfs_version || 'not applied' }}` |
+            | Build time | `${{ needs.build.outputs.build_time }}` |
 
-            Flash the AnyKernel3 zip from a custom recovery.
+            ### Installation
+
+            Flash the AnyKernel3 ZIP from a compatible custom recovery.
+
+            **Do not flash the boot image or kernel image unless you know that your device layout and boot image format are compatible.**
+
           files: release/*
+          fail_on_unmatched_files: true
+          generate_release_notes: false
