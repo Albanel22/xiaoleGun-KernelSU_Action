@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 
-# Kernel source patching:
-# SUSFS, path_umount backport, hide_stuff, manual hooks and KPM.
+# Kernel source patching: SUSFS, path_umount backport, hide_stuff, manual hooks.
 #
-# All operations are designed to be idempotent where possible. A patch that
-# is already present is skipped instead of being applied twice.
+# Everything here is idempotent and version-aware. Each step is skipped with a
+# clear message when it is unnecessary (feature already present) rather than
+# failing, because these trees are frequently already partially patched.
 
 set -euo pipefail
 
@@ -14,10 +14,19 @@ set -euo pipefail
 KERNEL_DIR=${KERNEL_DIR:?KERNEL_DIR must point at the kernel source tree}
 WORKSPACE=${WORKSPACE:-$(cd "${KERNEL_DIR}/.." && pwd)}
 
-# Resolve paths from this script location rather than $PWD.
+# Resolved from this file's location, not $PWD -- several helpers below run
+# with the working directory changed into the kernel tree.
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 # ====================================================================== SUSFS
+
+# susfs_branch_for KVER -- map a kernel version onto a susfs4ksu branch.
+#
+# susfs4ksu is branched per kernel version. The GKI branches are named after
+# the Android release they ship with; where a kernel version spans two Android
+# releases (5.10 -> android12/android13, 5.15 -> android13/android14) we pick
+# the older, which is the one the vast majority of trees are based on.
+# Override with SUSFS_BRANCH when that guess is wrong.
 
 susfs_branch_for() {
 	case "$1" in
@@ -28,32 +37,10 @@ susfs_branch_for() {
 		5.10) echo "gki-android12-5.10" ;;
 		5.15) echo "gki-android13-5.15" ;;
 		6.1)  echo "gki-android14-6.1" ;;
-		6.6)  echo "gki-android15-6.6" ;;
+		6.6) echo "gki-android15-6.6" ;;
 		6.12) echo "gki-android16-6.12" ;;
 		*)    echo "" ;;
 	esac
-}
-
-susfs_is_bundled() {
-	local bundled=${KSU_SUSFS_BUNDLED_REFS:--}
-	local ref=${KSU_REF_RESOLVED:-}
-	local r
-
-	# Explicitly configured bundled refs.
-	if [ "$bundled" != "-" ]; then
-		for r in $bundled; do
-			[ "$r" = "$ref" ] && return 0
-		done
-	fi
-
-	# Authoritative fallback: inspect the actual KernelSU tree.
-	local ksu_dir="${KERNEL_DIR}/${KSU_DIR:-KernelSU}"
-
-	[ -d "$ksu_dir" ] || return 1
-
-	grep -rEq \
-		'CONFIG_KSU_SUSFS|^[[:space:]]*config[[:space:]]+KSU_SUSFS' \
-		"$ksu_dir" 2>/dev/null
 }
 
 susfs_apply() {
@@ -70,31 +57,30 @@ susfs_apply() {
 		branch=$(susfs_branch_for "$kver")
 
 		if [ -z "$branch" ]; then
-			die "no SUSFS branch is known for kernel ${kver}; set SUSFS_BRANCH explicitly"
+			die "no susfs4ksu branch is known for kernel ${kver}; set SUSFS_BRANCH explicitly.
+Available: $(git ls-remote --heads "$repo" | awk '{print $2}' | sed 's@refs/heads/@@' | tr '\n' ' ')"
 		fi
 
-		info "kernel ${kver} -> SUSFS branch '${branch}'"
+		info "kernel ${kver} -> susfs branch '${branch}'"
 	fi
 
-	ref_exists "$repo" "$branch" || {
-		die "SUSFS repository has no branch '${branch}'"
-	}
+	ref_exists "$repo" "$branch" || die "susfs4ksu has no branch '${branch}'.
+Available: $(git ls-remote --heads "$repo" | awk '{print $2}' | sed 's@refs/heads/@@' | tr '\n' ' ')"
 
 	local susfs_dir="${WORKSPACE}/susfs4ksu"
+
 	rm -rf "$susfs_dir"
 
-	retry 3 git clone -q --depth=1 -b "$branch" \
-		"$repo" "$susfs_dir" \
+	retry 3 git clone -q --depth=1 -b "$branch" "$repo" "$susfs_dir" \
 		|| die "failed to clone ${repo} @ ${branch}"
 
 	local kp="${susfs_dir}/kernel_patches"
 
-	[ -d "$kp" ] || die \
-		"unexpected susfs4ksu layout: ${kp} is missing"
+	[ -d "$kp" ] \
+		|| die "unexpected susfs4ksu layout: ${kp} missing"
 
-	# ---------------------------------------------------------------- sources
-
-	info "copying SUSFS sources into kernel tree"
+	# 1. Drop in the SUSFS sources. The non-GKI branches carry sus_su.c too.
+	info "copying SUSFS sources into the kernel tree"
 
 	cp -v "${kp}/fs/"*.c \
 		"${KERNEL_DIR}/fs/" 2>/dev/null || true
@@ -102,115 +88,129 @@ susfs_apply() {
 	cp -v "${kp}/include/linux/"*.h \
 		"${KERNEL_DIR}/include/linux/" 2>/dev/null || true
 
-	# --------------------------------------------------------------- kernel patch
-
+	# 2. Patch the kernel itself.
 	local kernel_patch="${kp}/50_add_susfs_in_${branch}.patch"
 
 	if [ ! -f "$kernel_patch" ]; then
+		# Fall back to whatever 50_* patch the branch actually ships.
 		kernel_patch=$(find "$kp" -maxdepth 1 \
-			-type f \
 			-name '50_add_susfs_in_*.patch' \
 			-print -quit)
 	fi
 
-	[ -n "$kernel_patch" ] &&
-	[ -f "$kernel_patch" ] ||
-		die "no 50_add_susfs_in_*.patch found in ${kp}"
+	[ -n "$kernel_patch" ] && [ -f "$kernel_patch" ] \
+		|| die "no 50_add_susfs_in_*.patch found in ${kp}"
 
-	# Do not apply the same patch twice.
-	if (cd "$KERNEL_DIR" && patch -p1 --dry-run < "$kernel_patch" >/dev/null 2>&1); then
-		(
-			cd "$KERNEL_DIR"
-			apply_patch "$kernel_patch" 1
-		) || die "SUSFS kernel patch failed to apply"
-	else
-		info "SUSFS kernel patch appears to be already applied; skipping"
-	fi
+	(
+		cd "$KERNEL_DIR"
+		apply_patch "$kernel_patch" 1
+	) || die "the SUSFS kernel patch did not apply cleanly.
+This usually means SUSFS_BRANCH does not match your kernel.
+Detected kernel ${kver}, used branch '${branch}'."
 
-	# ---------------------------------------------------------- KernelSU patch
+	# 3. Patch the KernelSU side -- but only when the variant does not already
+	# ship SUSFS support. SukiSU-Ultra's 'builtin' branch, for instance,
+	# declares CONFIG_KSU_SUSFS itself; applying the patch on top conflicts.
 
 	local ksu_dir="${KERNEL_DIR}/${KSU_DIR:-KernelSU}"
 	local ksu_patch="${kp}/KernelSU/10_enable_susfs_for_ksu.patch"
 
 	if susfs_is_bundled; then
-		info "${KSU_NAME:-selected KernelSU variant} already bundles SUSFS; skipping KernelSU-side patch"
-
+		info "${KSU_NAME:-the selected variant} already bundles SUSFS at ref '${KSU_REF_RESOLVED:-}'; skipping 10_enable_susfs_for_ksu.patch"
 	elif [ ! -d "$ksu_dir" ]; then
-		warn "KernelSU directory not found at ${ksu_dir}; skipping KernelSU-side SUSFS patch"
-
+		warn "KernelSU directory ${ksu_dir} not found; skipping the KernelSU-side SUSFS patch"
 	elif [ ! -f "$ksu_patch" ]; then
-		warn "SUSFS branch '${branch}' does not contain KernelSU/10_enable_susfs_for_ksu.patch"
-
-	elif (
-		cd "$ksu_dir"
-		patch -p1 --dry-run < "$ksu_patch" >/dev/null 2>&1
-	); then
+		warn "branch ${branch} ships no KernelSU/10_enable_susfs_for_ksu.patch; skipping"
+	else
 		(
 			cd "$ksu_dir"
 			apply_patch "$ksu_patch" 1
-		) || die "KernelSU-side SUSFS patch failed"
-
-	else
-		info "KernelSU-side SUSFS patch appears to be already applied; skipping"
+		) || {
+			warn "the KernelSU-side SUSFS patch did not apply."
+			warn "susfs4ksu's non-GKI branches were last updated in early 2025 and still"
+			warn "target the old flat KernelSU layout; modern forks have since moved to a"
+			warn "modular kernel/ tree. Try a variant/ref whose layout matches, or a fork"
+			warn "that bundles SUSFS itself (e.g. KSU_VARIANT=sukisu-ultra KSU_REF=builtin)."
+			die "SUSFS integration failed"
+		}
 	fi
 
-	# --------------------------------------------------------------- version
+	# Record the SUSFS version for the build summary.
+	local sv
 
-	local sv="unknown"
+	sv=$(sed -nE \
+		's/.*SUSFS_VERSION[[:space:]]+"([^"]+)".*/\1/p' \
+		"${KERNEL_DIR}/include/linux/susfs.h" 2>/dev/null \
+		| head -n1)
 
-	if [ -f "${KERNEL_DIR}/include/linux/susfs.h" ]; then
-		sv=$(
-			sed -nE \
-				's/.*SUSFS_VERSION[[:space:]]+"([^"]+)".*/\1/p' \
-				"${KERNEL_DIR}/include/linux/susfs.h" |
-			head -n1
-		)
-
-		[ -n "$sv" ] || sv="unknown"
-	fi
-
-	export_env SUSFS_VERSION "$sv"
+	export_env SUSFS_VERSION "${sv:-unknown}"
 	export_env SUSFS_BRANCH_RESOLVED "$branch"
 
-	ok "SUSFS ${sv} applied from branch ${branch}"
-	summary "| SUSFS | \`${sv}\` (branch \`${branch}\`) |"
+	ok "SUSFS ${sv:-?} applied from branch ${branch}"
+	summary "| SUSFS | \`${sv:-unknown}\` (branch \`${branch}\`) |"
 
 	endgroup
+}
+
+# Does the selected variant+ref already contain SUSFS?
+
+susfs_is_bundled() {
+	local bundled=${KSU_SUSFS_BUNDLED_REFS:--}
+	local ref=${KSU_REF_RESOLVED:-}
+
+	[ "$bundled" = "-" ] && return 1
+
+	local r
+
+	for r in $bundled; do
+		[ "$r" = "$ref" ] && return 0
+	done
+
+	# Fall back to inspecting the tree, which is authoritative.
+	local ksu_dir="${KERNEL_DIR}/${KSU_DIR:-KernelSU}"
+
+	[ -d "$ksu_dir" ] || return 1
+
+	grep -rqsE \
+		'CONFIG_KSU_SUSFS|config KSU_SUSFS' \
+		"${ksu_dir}/kernel/Kconfig" \
+		2>/dev/null
 }
 
 susfs_defconfig() {
 	local defconfig=$1
 	local ksu_dir="${KERNEL_DIR}/${KSU_DIR:-KernelSU}"
 
-	# Discover the actual SUSFS symbols from the patched tree.
-	# This avoids hardcoding a symbol list because SUSFS v1/v2 branches differ.
+	# The SUSFS option set is NOT stable across branches, so it is discovered
+	# from the Kconfig that was actually patched in rather than hardcoded.
+	#
+	# Concretely: the GKI branches ship SUSFS v2.x, which declares SUS_MAP and
+	# has dropped the AUTO_ADD_*/SUS_OVERLAYFS/HAS_MAGIC_MOUNT knobs. The
+	# non-GKI branches are still on v1.5.5 (last touched early 2025), which is
+	# the exact opposite: it has the AUTO_ADD_* family and no SUS_MAP. A
+	# hardcoded list is therefore wrong on one side or the other -- and wrong
+	# in the silent direction, since an unknown symbol in a defconfig is simply
+	# dropped, leaving the feature off with no warning.
 
-	local syms=""
+	local syms
 
-	if [ -d "$ksu_dir" ]; then
-		syms=$(
-			grep -rhoE \
-				'^[[:space:]]*config[[:space:]]+KSU_SUSFS[A-Z_]*' \
-				"$ksu_dir" 2>/dev/null |
-			awk '{print $2}' |
-			sort -u || true
-		)
-	fi
-
-	# Some branches expose Kconfig from the kernel tree instead.
-	if [ -z "$syms" ]; then
-		syms=$(
-			grep -rhoE \
-				'^[[:space:]]*config[[:space:]]+KSU_SUSFS[A-Z_]*' \
-				"${KERNEL_DIR}/fs" \
-				"${KERNEL_DIR}/drivers" 2>/dev/null |
-			awk '{print $2}' |
-			sort -u || true
-		)
-	fi
+	syms=$(
+		grep -rhoE \
+			'^[[:space:]]*config[[:space:]]+KSU_SUSFS[A-Z_]*' \
+			"$ksu_dir" \
+			"${KERNEL_DIR}/fs/Kconfig" \
+			"${KERNEL_DIR}/drivers/kernelsu" \
+			2>/dev/null \
+		| awk '{print $2}' \
+		| sort -u
+	)
 
 	if [ -z "$syms" ]; then
-		die "no KSU_SUSFS Kconfig symbols found after SUSFS integration"
+		die "found no KSU_SUSFS Kconfig symbols to enable.
+The SUSFS sources are in the tree but nothing declares its options,
+so the feature would silently compile out and you would ship a kernel
+that looks patched but hides nothing. Check that the KernelSU-side patch
+applied, or pick a variant that bundles SUSFS."
 	fi
 
 	local s
@@ -218,10 +218,10 @@ susfs_defconfig() {
 
 	for s in $syms; do
 		case "$s" in
-			KSU_SUSFS_SUS_SU|KSU_SUSFS_SUS_OVERLAYFS)
-				# These options are intentionally disabled in the reference
-				# configurations because they can conflict with the selected
-				# KernelSU implementation.
+			# sus_su is the legacy in-kernel su backend, superseded by the
+			# manager; overlayfs hiding conflicts with magic mount. Both are
+			# off in the reference builds.
+			KSU_SUSFS_SUS_SU | KSU_SUSFS_SUS_OVERLAYFS)
 				kconf_disable "$defconfig" "CONFIG_${s}"
 				;;
 
@@ -238,41 +238,50 @@ susfs_defconfig() {
 
 # =============================================================== path_umount
 
+# path_umount() landed upstream in Linux 5.9. KernelSU uses it to unmount its
+# own overlays before handing control to an app that is checking for root, so
+# on older trees it has to be backported or module unmounting silently no-ops.
+#
+# The body below is upstream's, unchanged. It is inserted immediately before
+# the comment that introduces the umount syscall, which puts it after
+# do_umount() -- its only forward dependency -- in every tree from 4.9 to 5.4.
+
 path_umount_apply() {
 	local ns="${KERNEL_DIR}/fs/namespace.c"
 
 	group "Backporting path_umount()"
 
 	local kver
+
 	kver=$(kernel_version "$KERNEL_DIR") \
 		|| die "cannot read kernel version"
 
 	if ver_ge "$kver" "5.9"; then
-		info "kernel ${kver} already provides path_umount(); nothing to do"
+		info "kernel ${kver} already provides path_umount() upstream; nothing to do"
 		endgroup
 		return 0
 	fi
 
 	[ -f "$ns" ] || die "fs/namespace.c not found"
 
-	if grep -qE '^[[:space:]]*(static[[:space:]]+)?int[[:space:]]+path_umount[[:space:]]*\(' "$ns"; then
-		info "path_umount() already exists; nothing to do"
+	if grep -qE '^int path_umount|^static int path_umount' "$ns"; then
+		info "path_umount() is already present in fs/namespace.c; nothing to do"
 		endgroup
 		return 0
 	fi
 
 	local anchor='Now umount can handle mount points as well as block devices'
 
-	grep -q "$anchor" "$ns" || {
-		die "could not find path_umount insertion point in fs/namespace.c"
-	}
+	grep -q "$anchor" "$ns" \
+		|| die "could not find the insertion point in fs/namespace.c; patch this kernel manually"
 
 	local snippet
 	snippet=$(mktemp)
 
-	# can_umount() was introduced together with path_umount().
-	if ! grep -qE '^[[:space:]]*static[[:space:]]+int[[:space:]]+can_umount[[:space:]]*\(' "$ns"; then
-		cat >"$snippet" <<'EOF'
+	# 'can_umount' is a separate helper upstream; guard it in case a partial
+	# backport already added it.
+	if ! grep -q 'static int can_umount' "$ns"; then
+		cat >>"$snippet" <<'EOF'
 static int can_umount(const struct path *path, int flags)
 {
 	struct mount *mnt = real_mount(path->mnt);
@@ -285,11 +294,10 @@ static int can_umount(const struct path *path, int flags)
 		return -EINVAL;
 	if (!check_mnt(mnt))
 		return -EINVAL;
-	if (mnt->mnt.mnt_flags & MNT_LOCKED)
+	if (mnt->mnt.mnt_flags & MNT_LOCKED) /* Check optimistically */
 		return -EINVAL;
 	if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
 		return -EPERM;
-
 	return 0;
 }
 
@@ -306,24 +314,25 @@ int path_umount(struct path *path, int flags)
 	if (!ret)
 		ret = do_umount(mnt, flags);
 
-	/* We must not call path_put(), as that would clear mnt_expiry_mark. */
+	/* we mustn't call path_put() as that would clear mnt_expiry_mark */
 	dput(path->dentry);
 	mntput_no_expire(mnt);
-
 	return ret;
 }
 
 EOF
 
+	# Insert before the line *above* the anchor comment body, i.e. at the '/*'
+	# that opens it.
 	local lineno
+
 	lineno=$(grep -n "$anchor" "$ns" | head -n1 | cut -d: -f1)
 
+	# Walk back to the opening '/*' of that comment block.
 	local start=$lineno
 
-	while [ "$start" -gt 1 ]; do
-		if sed -n "${start}p" "$ns" | grep -q '/\*'; then
-			break
-		fi
+	while [ "$start" -gt 1 ] &&
+		! sed -n "${start}p" "$ns" | grep -q '/\*'; do
 		start=$((start - 1))
 	done
 
@@ -337,8 +346,8 @@ EOF
 	mv "$tmp" "$ns"
 	rm -f "$snippet"
 
-	grep -qE '^[[:space:]]*int path_umount[[:space:]]*\(' "$ns" ||
-		die "path_umount() insertion failed"
+	grep -q '^int path_umount' "$ns" \
+		|| die "path_umount() insertion failed"
 
 	ok "path_umount() backported into fs/namespace.c (kernel ${kver})"
 	summary "| path_umount | backported (kernel ${kver}) |"
@@ -346,52 +355,51 @@ EOF
 	endgroup
 }
 
-# ================================================================ extra patches
+# ============================================================== extra patches
 
 SUKISU_PATCH_REPO=${SUKISU_PATCH_REPO:-https://github.com/ShirkNeko/SukiSU_patch.git}
+
+# Clone the shared patch/tool repo once, on demand.
 
 sukisu_patch_dir() {
 	local dir="${WORKSPACE}/SukiSU_patch"
 
 	if [ ! -d "$dir" ]; then
 		retry 3 git clone -q --depth=1 \
-			"$SUKISU_PATCH_REPO" "$dir" ||
-			die "failed to clone ${SUKISU_PATCH_REPO}"
+			"$SUKISU_PATCH_REPO" "$dir" \
+			|| die "failed to clone ${SUKISU_PATCH_REPO}"
 	fi
 
 	printf '%s' "$dir"
 }
 
+# hide_stuff removes the most obvious KernelSU fingerprints from the build.
+
 hide_stuff_apply() {
 	group "Applying hide_stuff"
 
 	local dir
-	dir=$(sukisu_patch_dir)
+	local patch
 
-	local patch="${dir}/69_hide_stuff.patch"
+	dir=$(sukisu_patch_dir)
+	patch="${dir}/69_hide_stuff.patch"
 
 	if [ ! -f "$patch" ]; then
-		warn "69_hide_stuff.patch not found; skipping"
+		warn "69_hide_stuff.patch not found in the patch repo; skipping"
 		endgroup
 		return 0
 	fi
 
-	if (
+	(
 		cd "$KERNEL_DIR"
-		patch -p1 --dry-run < "$patch" >/dev/null 2>&1
-	); then
-		(
-			cd "$KERNEL_DIR"
-			apply_patch "$patch" 1
-		) || warn "hide_stuff patch failed; continuing"
-	else
-		info "hide_stuff patch already applied or not applicable; skipping"
-	fi
+		apply_patch "$patch" 1
+	) || warn "hide_stuff did not apply cleanly; continuing"
 
 	endgroup
 }
 
-# ================================================================ manual hooks
+# Manual/syscall hook patches for pre-GKI trees, used when the fork expects the
+# hooks to already exist in the kernel source rather than hooking via kprobes.
 
 hooks_patch_apply() {
 	local variant=${KSU_VARIANT:-none}
@@ -401,8 +409,7 @@ hooks_patch_apply() {
 
 	group "Applying manual syscall hooks (kernel ${kver})"
 
-	# ----------------------------------------------------------- ReSukiSU
-
+	# ReSukiSU publishes scope-minimised hook patches keyed by kernel version.
 	if [ "$variant" = "resukisu" ]; then
 		local dir="${WORKSPACE}/ReSukiSU_Patches"
 
@@ -417,88 +424,69 @@ hooks_patch_apply() {
 		if [ -f "$p" ]; then
 			if (
 				cd "$KERNEL_DIR"
-				patch -p1 --dry-run < "$p" >/dev/null 2>&1
+				apply_patch "$p" 1
 			); then
-				(
-					cd "$KERNEL_DIR"
-					apply_patch "$p" 1
-				) || die "ReSukiSU hook patch failed"
-
-				ok "ReSukiSU hooks applied"
 				endgroup
 				return 0
-			else
-				info "ReSukiSU hook patch already applied or not applicable"
 			fi
 		else
-			info "ReSukiSU has no scope-minimized patch for kernel ${kver}"
+			info "ReSukiSU ships no scope-minimized patch for kernel ${kver}"
 		fi
 	fi
 
-	# ----------------------------------------------------------- SukiSU-Ultra
-
+	# SukiSU's patch repo carries per-version hook patches too.
 	if [ "$variant" = "sukisu-ultra" ]; then
 		local dir
-		dir=$(sukisu_patch_dir)
-
 		local p
+
+		dir=$(sukisu_patch_dir)
 
 		for p in \
 			"${dir}/${kver}/"*hook*.patch \
-			"${dir}/hooks/syscall_hooks.patch"
-		do
+			"${dir}/hooks/syscall_hooks.patch"; do
+
 			[ -f "$p" ] || continue
 
 			if (
 				cd "$KERNEL_DIR"
-				patch -p1 --dry-run < "$p" >/dev/null 2>&1
+				apply_patch "$p" 1
 			); then
-				(
-					cd "$KERNEL_DIR"
-					apply_patch "$p" 1
-				) || die "SukiSU hook patch failed"
-
-				ok "SukiSU hooks applied"
 				endgroup
 				return 0
 			fi
 		done
 	fi
 
-	# ----------------------------------------------------------- legacy fallback
+	# Fall back to the in-repo sed script, which is what this action shipped
+	# historically and still works for the 4.9-5.4 KernelSU 0.9.x hook API.
+	info "falling back to the bundled legacy hook script"
 
-	local legacy="${REPO_ROOT}/patches/legacy_ksu_hooks.sh"
-
-	if [ -f "$legacy" ]; then
-		info "falling back to bundled legacy KernelSU hook script"
-		(
-			cd "$KERNEL_DIR"
-			bash "$legacy"
-		)
-	else
-		warn "legacy hook script not found: ${legacy}"
-	fi
+	(
+		cd "$KERNEL_DIR"
+		bash "${REPO_ROOT}/patches/legacy_ksu_hooks.sh"
+	)
 
 	endgroup
 }
 
 # ======================================================================== KPM
 
+# SukiSU-Ultra's Kernel Patch Module support needs a post-link step: the
+# patch_linux tool rewrites the built Image and emits oImage.
+
 kpm_patch_image() {
 	local image=$1
 
 	group "Applying KPM (patch_linux)"
 
-	[ -f "$image" ] ||
-		die "KPM input image not found: ${image}"
-
 	local dir
+	local tool
+
 	dir=$(sukisu_patch_dir)
+	tool="${dir}/kpm/patch_linux"
 
-	local tool="${dir}/kpm/patch_linux"
-
-	[ -f "$tool" ] ||
-		die "kpm/patch_linux not found in ${SUKISU_PATCH_REPO}"
+	[ -f "$tool" ] \
+		|| die "kpm/patch_linux not found in ${SUKISU_PATCH_REPO}"
 
 	chmod +x "$tool"
 
@@ -507,10 +495,15 @@ kpm_patch_image() {
 		"$tool" "$(basename "$image")"
 	) || die "patch_linux failed"
 
-	local out="$(dirname "$image")/oImage"
+	# IMPORTANT:
+	# Keep declaration and assignment separate.
+	# ShellCheck SC2155 treats local+command substitution as a warning,
+	# and this repository promotes ShellCheck warnings to CI failures.
+	local out
+	out="$(dirname "$image")/oImage"
 
-	[ -f "$out" ] ||
-		die "patch_linux did not produce oImage"
+	[ -f "$out" ] \
+		|| die "patch_linux did not produce oImage"
 
 	mv -f "$out" "$image"
 
@@ -520,11 +513,10 @@ kpm_patch_image() {
 	endgroup
 }
 
-# ----------------------------------------------------------------------- main
+# --------------------------------------------------------------------- main ---
 
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 	case "${1:-all}" in
-
 		susfs)
 			susfs_apply
 			;;
@@ -542,29 +534,27 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 			;;
 
 		kpm)
-			[ -n "${2:-}" ] ||
-				die "kpm requires the image path"
-
+			[ -n "${2:-}" ] || die "kpm requires an image path"
 			kpm_patch_image "$2"
 			;;
 
 		all)
-			# Order matters:
+			# Order matters and this is the tested one (4.19 + SukiSU builtin
+			# + SUSFS 1.5.5, no rejects):
 			#
-			# 1. path_umount
-			# 2. manual hooks
-			# 3. SUSFS
-			# 4. hide_stuff
-			#
-			# The first two operate on kernel files that SUSFS can modify,
-			# therefore they are deliberately executed before SUSFS.
+			# path_umount and the hook patches both key off textual anchors
+			# in files that SUSFS later rewrites, so they go first.
 
 			if is_true "${ENABLE_PATH_UMOUNT:-false}"; then
 				path_umount_apply
 			fi
 
+			# Driven by the *resolved* hook mode, not the raw setting, so that
+			# KSU_HOOK_MODE=auto on a pre-GKI kernel still gets its hooks
+			# patched in rather than only getting the Kconfig symbol set.
+
 			if [ "${KSU_VARIANT:-none}" != "none" ] &&
-				[ "${KSU_HOOK_MODE_RESOLVED:-${KSU_HOOK_MODE:-auto}}" = "manual" ]; then
+				[ "${KSU_HOOK_MODE_RESOLVED:-}" = "manual" ]; then
 				hooks_patch_apply
 			fi
 
