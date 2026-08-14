@@ -1,23 +1,24 @@
 #!/usr/bin/env bash
+
 # Resolve the build configuration, validate it, and export it to later steps.
 #
 # Resolution order (last wins):
-#   1. built-in defaults below
-#   2. the config file named by CONFIG_ENV (default: config.env)
-#   3. workflow_dispatch inputs, passed in as IN_<KEY> environment variables
+#   1. built-in defaults
+#   2. CONFIG_ENV / config.env
+#   3. workflow_dispatch IN_<KEY> overrides
 #
-# The old workflow parsed config.env with
-#     grep -w "$KEY" config.env | head -n1 | cut -d= -f2
-# which truncates any value containing '=', matches commented-out lines, and
-# matches a key that merely appears as a substring of a comment. That is why
-# EXTRA_CMDS had to use a ':' separator. Both forms are still accepted here,
-# but parsing is now anchored and comment-aware, so '=' in values is fine.
+# The special workflow value "config" means:
+#   "use the value from config.env"
+#
+# This keeps the Run workflow menu compatible with config.env while allowing
+# individual options to override the file when explicitly selected.
 
 set -euo pipefail
+
 # shellcheck source=scripts/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-CONFIG_FILE=${CONFIG_ENV:-config.env}
+CONFIG_FILE="${CONFIG_ENV:-config.env}"
 
 # --------------------------------------------------------------- defaults ---
 
@@ -85,7 +86,9 @@ declare -A DEFAULTS=(
 	[REMOVE_UNUSED_PACKAGES]="true"
 )
 
-# Legacy spellings that must keep working for existing forks' config.env files.
+# --------------------------------------------------------------- aliases ----
+
+# Legacy spellings kept for existing config.env files.
 declare -A ALIASES=(
 	[DISABLE-LTO]="DISABLE_LTO"
 	[KERNELSU_TAG]="KSU_REF"
@@ -93,170 +96,452 @@ declare -A ALIASES=(
 	[ENABLE_KERNELSU]="_LEGACY_ENABLE_KERNELSU"
 )
 
-# ----------------------------------------------------------------- parsing ---
+# ---------------------------------------------------------------- parsing ----
 
-# cfg_read FILE KEY -- first non-comment "KEY=value" or "KEY:value" line.
+# cfg_read FILE KEY
+#
+# Reads the first active line matching:
+#
+#   KEY=value
+#   KEY:value
+#
+# Leading whitespace is allowed.
+# Lines beginning with # are ignored.
+# '=' inside the value is preserved.
 cfg_read() {
-	local file=$1 key=$2
+	local file="$1"
+	local key="$2"
+
 	[ -f "$file" ] || return 0
-	sed -nE "s/\r$//; s/^[[:space:]]*${key}[[:space:]]*[=:][[:space:]]*(.*)$/\1/p" "$file" \
-		| head -n1 \
-		| sed -E 's/[[:space:]]+$//'
+
+	sed -nE \
+		"s/^[[:space:]]*${key}[[:space:]]*[=:][[:space:]]*(.*)$/\1/p" \
+		"$file" |
+		head -n1 |
+		sed -E 's/[[:space:]]+$//'
 }
 
+# ---------------------------------------------------------------- resolve ----
+
 resolve() {
-	local key val
+	local key
+	local val
+	local from_file
+	local in_var
+	local in_val
+
 	for key in "${!DEFAULTS[@]}"; do
-		val=${DEFAULTS[$key]}
+		val="${DEFAULTS[$key]}"
 
-		local from_file
-		from_file=$(cfg_read "$CONFIG_FILE" "$key")
-		[ -n "$from_file" ] && val=$from_file
+		# ---------------------------------------------------------
+		# 1. config.env
+		# ---------------------------------------------------------
 
-		# Workflow inputs win over the file, but only when actually provided.
-		#
-		# The sentinel "config" means "leave the config file's value alone".
-		# The dispatch form needs it because a GitHub boolean input always has
-		# a concrete value: with a plain checkbox defaulting to false, a user
-		# who set ENABLE_SUSFS=true in their profile and then ran the form
-		# without touching anything would silently get SUSFS turned back off.
-		local in_var="IN_${key}"
-		local in_val=${!in_var:-}
-		if [ -n "$in_val" ] && [ "$in_val" != "config" ]; then
-			val=$in_val
+		from_file="$(cfg_read "$CONFIG_FILE" "$key")"
+
+		if [ -n "$from_file" ]; then
+			val="$from_file"
 		fi
 
-		CFG[$key]=$val
+		# ---------------------------------------------------------
+		# 2. workflow input
+		# ---------------------------------------------------------
+		#
+		# "config" is deliberately ignored here.
+		# It means "use config.env".
+		#
+
+		in_var="IN_${key}"
+		in_val="${!in_var:-}"
+
+		if [ -n "$in_val" ] && [ "$in_val" != "config" ]; then
+			val="$in_val"
+		fi
+
+		CFG["$key"]="$val"
 	done
 
-	# Fold legacy keys in only where the modern key was not already set.
-	local legacy modern
+	# -------------------------------------------------------------
+	# Legacy configuration aliases
+	# -------------------------------------------------------------
+
+	local legacy
+	local modern
+	local lv
+	local mv
+	local modern_input
+
 	for legacy in "${!ALIASES[@]}"; do
-		modern=${ALIASES[$legacy]}
-		local lv
-		lv=$(cfg_read "$CONFIG_FILE" "$legacy")
+		modern="${ALIASES[$legacy]}"
+
+		lv="$(cfg_read "$CONFIG_FILE" "$legacy")"
+
 		[ -n "$lv" ] || continue
+
 		case "$modern" in
-			_LEGACY_*) CFG[$modern]=$lv ;;
+			_LEGACY_*)
+				CFG["$modern"]="$lv"
+				;;
+
 			*)
-				# Only honour the legacy spelling when the modern one is absent
-				# from the file and no input overrode it.
-				local mv in_var="IN_${modern}"
-				mv=$(cfg_read "$CONFIG_FILE" "$modern")
-				if [ -z "$mv" ] && [ -z "${!in_var:-}" ]; then
-					CFG[$modern]=$lv
-					debug "legacy key ${legacy} -> ${modern}=${lv}"
+				mv="$(cfg_read "$CONFIG_FILE" "$modern")"
+				modern_input="IN_${modern}"
+
+				if [ -z "$mv" ] &&
+					[ -z "${!modern_input:-}" ]; then
+
+					CFG["$modern"]="$lv"
+
+					debug \
+						"legacy key ${legacy} -> ${modern}=${lv}"
 				fi
 				;;
 		esac
 	done
 }
 
-# --------------------------------------------- legacy compatibility bridge ---
+# --------------------------------------------- legacy compatibility bridge ----
 
-# Old config.env used ENABLE_KERNELSU=true plus KERNELSU_TAG to mean
-# "install tiann/KernelSU". Translate that into the new variant selector so
-# existing forks keep building without editing anything.
 apply_legacy_bridge() {
-	local legacy_enable=${CFG[_LEGACY_ENABLE_KERNELSU]:-}
-	local legacy_patch=${CFG[_LEGACY_APPLY_KSU_PATCH]:-}
+	local legacy_enable
+	local legacy_patch
 
-	if [ "${CFG[KSU_VARIANT]}" = "none" ] && is_true "$legacy_enable"; then
+	legacy_enable="${CFG[_LEGACY_ENABLE_KERNELSU]:-}"
+	legacy_patch="${CFG[_LEGACY_APPLY_KSU_PATCH]:-}"
+
+	# Old config:
+	#
+	# ENABLE_KERNELSU=true
+	# KERNELSU_TAG=...
+	#
+	# becomes:
+	#
+	# KSU_VARIANT=kernelsu
+
+	if [ "${CFG[KSU_VARIANT]}" = "none" ] &&
+		is_true "$legacy_enable"; then
+
 		CFG[KSU_VARIANT]="kernelsu"
-		warn "config.env uses the legacy ENABLE_KERNELSU flag; treating it as KSU_VARIANT=kernelsu."
-		warn "Set KSU_VARIANT explicitly to pick a fork (kernelsu-next, sukisu-ultra, resukisu, ...)."
+
+		warn \
+			"legacy ENABLE_KERNELSU detected; treating it as KSU_VARIANT=kernelsu"
+
+		warn \
+			"Set KSU_VARIANT explicitly to select kernelsu-next, sukisu-ultra, resukisu, etc."
 	fi
 
-	# APPLY_KSU_PATCH used to mean "run the bundled sed script to add manual
-	# hooks". That is now the 'manual' hook mode.
-	if is_true "$legacy_patch" && [ "${CFG[KSU_HOOK_MODE]}" = "auto" ]; then
+	# Old APPLY_KSU_PATCH=true means manual hooks.
+	if is_true "$legacy_patch" &&
+		[ "${CFG[KSU_HOOK_MODE]}" = "auto" ]; then
+
 		CFG[KSU_HOOK_MODE]="manual"
-		warn "config.env uses the legacy APPLY_KSU_PATCH flag; treating it as KSU_HOOK_MODE=manual."
+
+		warn \
+			"legacy APPLY_KSU_PATCH detected; treating it as KSU_HOOK_MODE=manual"
 	fi
 
-	unset 'CFG[_LEGACY_ENABLE_KERNELSU]' 'CFG[_LEGACY_APPLY_KSU_PATCH]'
+	unset \
+		'CFG[_LEGACY_ENABLE_KERNELSU]' \
+		'CFG[_LEGACY_APPLY_KSU_PATCH]'
 }
 
-# -------------------------------------------------------------- validation ---
+# -------------------------------------------------------------- validation ----
+
+validate_bool() {
+	local key="$1"
+	local value="${CFG[$key]}"
+
+	case "$value" in
+		true|false)
+			;;
+
+		*)
+			warn \
+				"config: ${key} must be true or false (got '${value}')"
+			return 1
+			;;
+	esac
+}
 
 validate() {
 	local errors=0
-	_err() { warn "config: $*"; errors=$((errors + 1)); }
 
-	[ -n "${CFG[KERNEL_SOURCE]}" ]        || _err "KERNEL_SOURCE is required"
-	[ -n "${CFG[KERNEL_SOURCE_BRANCH]}" ] || _err "KERNEL_SOURCE_BRANCH is required"
-	[ -n "${CFG[KERNEL_CONFIG]}" ]        || _err "KERNEL_CONFIG is required"
-	[ -n "${CFG[KERNEL_IMAGE_NAME]}" ]    || _err "KERNEL_IMAGE_NAME is required"
+	_err() {
+		warn "config: $*"
+		errors=$((errors + 1))
+	}
+
+	# -------------------------------------------------------------
+	# Required kernel parameters
+	# -------------------------------------------------------------
+
+	[ -n "${CFG[KERNEL_SOURCE]}" ] ||
+		_err "KERNEL_SOURCE is required"
+
+	[ -n "${CFG[KERNEL_SOURCE_BRANCH]}" ] ||
+		_err "KERNEL_SOURCE_BRANCH is required"
+
+	[ -n "${CFG[KERNEL_CONFIG]}" ] ||
+		_err "KERNEL_CONFIG is required"
+
+	[ -n "${CFG[KERNEL_IMAGE_NAME]}" ] ||
+		_err "KERNEL_IMAGE_NAME is required"
+
+	# -------------------------------------------------------------
+	# Architecture
+	# -------------------------------------------------------------
 
 	case "${CFG[ARCH]}" in
-		arm64 | arm | x86_64 | riscv) ;;
-		*) _err "ARCH must be one of arm64/arm/x86_64/riscv (got '${CFG[ARCH]}')" ;;
+		arm64|arm|x86_64|riscv)
+			;;
+
+		*)
+			_err \
+				"ARCH must be one of arm64/arm/x86_64/riscv (got '${CFG[ARCH]}')"
+			;;
 	esac
+
+	# -------------------------------------------------------------
+	# KernelSU variant
+	# -------------------------------------------------------------
 
 	case "${CFG[KSU_VARIANT]}" in
-		none | kernelsu | kernelsu-next | sukisu-ultra | resukisu | rsuntk | backslashxx) ;;
-		*) _err "unknown KSU_VARIANT '${CFG[KSU_VARIANT]}'" ;;
+		none)
+			;;
+
+		kernelsu)
+			;;
+
+		kernelsu-next)
+			;;
+
+		sukisu-ultra)
+			;;
+
+		resukisu)
+			;;
+
+		rsuntk)
+			;;
+
+		backslashxx)
+			;;
+
+		*)
+			_err \
+				"unknown KSU_VARIANT '${CFG[KSU_VARIANT]}'"
+			;;
 	esac
+
+	# -------------------------------------------------------------
+	# Hook mode
+	# -------------------------------------------------------------
 
 	case "${CFG[KSU_HOOK_MODE]}" in
-		auto | kprobes | manual | tracepoint | syscall | none) ;;
-		*) _err "unknown KSU_HOOK_MODE '${CFG[KSU_HOOK_MODE]}'" ;;
+		auto|kprobes|manual|tracepoint|syscall|none)
+			;;
+
+		*)
+			_err \
+				"unknown KSU_HOOK_MODE '${CFG[KSU_HOOK_MODE]}'"
+			;;
 	esac
 
+	# -------------------------------------------------------------
+	# Boolean settings
+	# -------------------------------------------------------------
+
+	local bool_key
+
+	for bool_key in \
+		ADD_LOCALVERSION_TO_FILENAME \
+		USE_CUSTOM_CLANG \
+		USE_LLVM \
+		ENABLE_GCC_ARM64 \
+		ENABLE_GCC_ARM32 \
+		USE_CUSTOM_GCC_64 \
+		USE_CUSTOM_GCC_32 \
+		ENABLE_SUSFS \
+		ENABLE_PATH_UMOUNT \
+		ENABLE_HIDE_STUFF \
+		ENABLE_KPM \
+		ADD_KPROBES_CONFIG \
+		ADD_OVERLAYFS_CONFIG \
+		DISABLE_LTO \
+		DISABLE_CC_WERROR \
+		USE_CUSTOM_ANYKERNEL3 \
+		NEED_DTBO \
+		BUILD_BOOT_IMG \
+		ENABLE_CCACHE \
+		REMOVE_UNUSED_PACKAGES
+	do
+		if ! validate_bool "$bool_key"; then
+			errors=$((errors + 1))
+		fi
+	done
+
+	# -------------------------------------------------------------
+	# KernelSU dependencies
+	# -------------------------------------------------------------
+
 	if [ "${CFG[KSU_VARIANT]}" = "none" ]; then
+
 		is_true "${CFG[ENABLE_SUSFS]}" &&
-			_err "ENABLE_SUSFS requires a KSU_VARIANT other than 'none'"
+			_err \
+				"ENABLE_SUSFS requires KSU_VARIANT other than 'none'"
+
+		is_true "${CFG[ENABLE_PATH_UMOUNT]}" &&
+			_err \
+				"ENABLE_PATH_UMOUNT requires KSU_VARIANT other than 'none'"
+
+		is_true "${CFG[ENABLE_HIDE_STUFF]}" &&
+			_err \
+				"ENABLE_HIDE_STUFF requires KSU_VARIANT other than 'none'"
+
 		is_true "${CFG[ENABLE_KPM]}" &&
-			_err "ENABLE_KPM requires KSU_VARIANT=sukisu-ultra"
+			_err \
+				"ENABLE_KPM requires KSU_VARIANT=sukisu-ultra"
 	fi
 
-	# KPM is a SukiSU-Ultra feature and its patch_linux tool is 64-bit only.
+	# -------------------------------------------------------------
+	# KPM
+	# -------------------------------------------------------------
+
 	if is_true "${CFG[ENABLE_KPM]}"; then
+
 		[ "${CFG[KSU_VARIANT]}" = "sukisu-ultra" ] ||
-			_err "ENABLE_KPM is only supported with KSU_VARIANT=sukisu-ultra (got '${CFG[KSU_VARIANT]}')"
+			_err \
+				"ENABLE_KPM is only supported with KSU_VARIANT=sukisu-ultra (got '${CFG[KSU_VARIANT]}')"
+
 		[ "${CFG[ARCH]}" = "arm64" ] ||
-			_err "ENABLE_KPM requires ARCH=arm64"
+			_err \
+				"ENABLE_KPM requires ARCH=arm64"
 	fi
 
-	if is_true "${CFG[BUILD_BOOT_IMG]}" && [ -z "${CFG[SOURCE_BOOT_IMAGE]}" ]; then
-		_err "BUILD_BOOT_IMG=true requires SOURCE_BOOT_IMAGE"
+	# -------------------------------------------------------------
+	# Boot image
+	# -------------------------------------------------------------
+
+	if is_true "${CFG[BUILD_BOOT_IMG]}" &&
+		[ -z "${CFG[SOURCE_BOOT_IMAGE]}" ]; then
+
+		_err \
+			"BUILD_BOOT_IMG=true requires SOURCE_BOOT_IMAGE"
 	fi
 
-	if is_true "${CFG[USE_CUSTOM_CLANG]}" && [ -z "${CFG[CUSTOM_CLANG_SOURCE]}" ]; then
-		_err "USE_CUSTOM_CLANG=true requires CUSTOM_CLANG_SOURCE"
+	# -------------------------------------------------------------
+	# Custom clang
+	# -------------------------------------------------------------
+
+	if is_true "${CFG[USE_CUSTOM_CLANG]}" &&
+		[ -z "${CFG[CUSTOM_CLANG_SOURCE]}" ]; then
+
+		_err \
+			"USE_CUSTOM_CLANG=true requires CUSTOM_CLANG_SOURCE"
 	fi
 
-	if is_true "${CFG[USE_CUSTOM_ANYKERNEL3]}" && [ -z "${CFG[CUSTOM_ANYKERNEL3_SOURCE]}" ]; then
-		_err "USE_CUSTOM_ANYKERNEL3=true requires CUSTOM_ANYKERNEL3_SOURCE"
+	# -------------------------------------------------------------
+	# Custom AnyKernel3
+	# -------------------------------------------------------------
+
+	if is_true "${CFG[USE_CUSTOM_ANYKERNEL3]}" &&
+		[ -z "${CFG[CUSTOM_ANYKERNEL3_SOURCE]}" ]; then
+
+		_err \
+			"USE_CUSTOM_ANYKERNEL3=true requires CUSTOM_ANYKERNEL3_SOURCE"
 	fi
 
-	[ "$errors" -eq 0 ] || die "${errors} configuration error(s); fix ${CONFIG_FILE} or the workflow inputs"
+	# -------------------------------------------------------------
+	# GCC consistency
+	# -------------------------------------------------------------
+
+	if is_true "${CFG[USE_CUSTOM_GCC_64]}" &&
+		[ -z "${CFG[CUSTOM_GCC_64_SOURCE]}" ]; then
+
+		_err \
+			"USE_CUSTOM_GCC_64=true requires CUSTOM_GCC_64_SOURCE"
+	fi
+
+	if is_true "${CFG[USE_CUSTOM_GCC_32]}" &&
+		[ -z "${CFG[CUSTOM_GCC_32_SOURCE]}" ]; then
+
+		_err \
+			"USE_CUSTOM_GCC_32=true requires CUSTOM_GCC_32_SOURCE"
+	fi
+
+	# -------------------------------------------------------------
+	# Final result
+	# -------------------------------------------------------------
+
+	if [ "$errors" -ne 0 ]; then
+		die \
+			"${errors} configuration error(s); fix ${CONFIG_FILE} or the workflow inputs"
+	fi
 }
 
-# ------------------------------------------------------------------- main ---
+# ------------------------------------------------------------------- device ----
+
+derive_device() {
+	local device
+
+	device="$(
+		printf '%s' "${CFG[KERNEL_CONFIG]}" |
+			sed \
+				's!.*/!!;
+				 s/_defconfig$//;
+				 s/_user$//;
+				 s/-perf$//'
+	)"
+
+	[ -n "${CFG[KERNEL_NAME]}" ] &&
+		device="${CFG[KERNEL_NAME]}"
+
+	printf '%s' "$device"
+}
+
+# ------------------------------------------------------------------- summary ----
+
+print_configuration() {
+	summary "### Build configuration"
+	summary ""
+	summary "| Item | Value |"
+	summary "| --- | --- |"
+
+	group "Resolved configuration"
+
+	local key
+
+	for key in $(printf '%s\n' "${!CFG[@]}" | sort); do
+
+		printf \
+			'  %-32s = %s\n' \
+			"$key" \
+			"${CFG[$key]}"
+
+		export_env \
+			"$key" \
+			"${CFG[$key]}"
+	done
+
+	endgroup
+}
+
+# ------------------------------------------------------------------- main -------
 
 declare -A CFG
+
 resolve
 apply_legacy_bridge
 validate
 
-# Derive the device label from the defconfig name, as before.
-DEVICE=$(printf '%s' "${CFG[KERNEL_CONFIG]}" | sed 's!.*/!!; s/_defconfig$//; s/_user$//; s/-perf$//')
-[ -n "${CFG[KERNEL_NAME]}" ] && DEVICE=${CFG[KERNEL_NAME]}
-CFG[DEVICE]=$DEVICE
+DEVICE="$(derive_device)"
 
-summary "### Build configuration"
-summary ""
-summary "| Item | Value |"
-summary "| --- | --- |"
+CFG[DEVICE]="$DEVICE"
 
-group "Resolved configuration"
-for key in $(printf '%s\n' "${!CFG[@]}" | sort); do
-	printf '  %-32s = %s\n' "$key" "${CFG[$key]}"
-	export_env "$key" "${CFG[$key]}"
-done
-endgroup
+print_configuration
 
-export_env BUILD_TIME "$(TZ=${BUILD_TZ:-Asia/Shanghai} date '+%Y%m%d%H%M')"
+export_env \
+	BUILD_TIME \
+	"$(TZ="${BUILD_TZ:-Asia/Shanghai}" date '+%Y%m%d%H%M')"
 
 ok "configuration resolved (device: ${DEVICE})"
