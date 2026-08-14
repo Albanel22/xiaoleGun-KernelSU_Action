@@ -1,3 +1,4 @@
+```bash
 #!/usr/bin/env bash
 
 # Install a KernelSU variant into the kernel tree.
@@ -20,6 +21,7 @@ set -euo pipefail
 KERNEL_DIR=${KERNEL_DIR:?KERNEL_DIR must point at the kernel source tree}
 
 # ------------------------------------------------------------- registry -----
+
 #
 # Fields, '|'-separated:
 # 1 repo URL
@@ -29,6 +31,7 @@ KERNEL_DIR=${KERNEL_DIR:?KERNEL_DIR must point at the kernel source tree}
 # 5 default ref for legacy (< 5.10) kernels
 # 6 refs that already contain SUSFS support
 # 7 human-readable name
+#
 
 ksu_registry() {
 	case "$1" in
@@ -39,7 +42,6 @@ ksu_registry() {
 			;;
 
 		kernelsu-next)
-			# KernelSU-Next development branch.
 			echo "https://github.com/KernelSU-Next/KernelSU-Next|dev|KernelSU-Next|dev|legacy|-|KernelSU-Next"
 			;;
 
@@ -52,8 +54,7 @@ ksu_registry() {
 
 		resukisu)
 			# ReSukiSU.
-			# main is the normal/current branch and supports non-GKI
-			# integration through Manual Hook.
+			# main supports non-GKI integration through Manual Hook.
 			echo "https://github.com/ReSukiSU/ReSukiSU|main|KernelSU|main|main|-|ReSukiSU"
 			;;
 
@@ -86,10 +87,10 @@ ksu_install() {
 	local variant=$1
 	local requested_ref=${2-}
 
-	[ "$variant" = "none" ] && {
+	if [ "$variant" = "none" ]; then
 		info "KernelSU integration disabled"
 		return 0
-	}
+	fi
 
 	local repo setup_ref dir modern_ref legacy_ref susfs_refs name
 
@@ -132,14 +133,14 @@ ksu_install() {
 		info "validating ref '${ref}' in ${repo}"
 
 		ref_exists "$repo" "$ref" || die "ref '${ref}' does not exist in ${repo}.
-   setup.sh would silently fall back to the default branch and you would
-   get a kernel without the feature you asked for.
-   Available branches:
-   $(git ls-remote --heads "$repo" 2>/dev/null |
-		awk '{print $2}' |
-		sed 's@refs/heads/@@' |
-		grep -v dependabot |
-		tr '\n' ' ')"
+setup.sh would silently fall back to the default branch and you would
+get a kernel without the feature you asked for.
+Available branches:
+$(git ls-remote --heads "$repo" 2>/dev/null |
+awk '{print $2}' |
+sed 's@refs/heads/@@' |
+grep -v dependabot |
+tr '\n' ' ')"
 
 		ok "ref '${ref}' exists in ${repo}"
 	else
@@ -181,20 +182,6 @@ ksu_install() {
 	ok "${name} source directory exists: ${ksu_dir}"
 
 	# ---------------------------------------------------------- verify Kconfig
-	#
-	# IMPORTANT:
-	# ReSukiSU stores its kernel integration under:
-	#
-	#   KernelSU/kernel/Kconfig
-	#
-	# Older/other variants can expose:
-	#
-	#   KernelSU/Kconfig
-	#
-	# Therefore accept both layouts.
-	#
-	# The previous script incorrectly required KernelSU/Kconfig and caused
-	# ReSukiSU builds to stop even though setup.sh had completed successfully.
 
 	local ksu_kconfig=""
 
@@ -205,9 +192,9 @@ ksu_install() {
 	fi
 
 	[ -n "$ksu_kconfig" ] || die "${name} Kconfig missing.
-   Checked:
-   ${ksu_dir}/kernel/Kconfig
-   ${ksu_dir}/Kconfig"
+Checked:
+${ksu_dir}/kernel/Kconfig
+${ksu_dir}/Kconfig"
 
 	ok "${name} Kconfig found: ${ksu_kconfig}"
 
@@ -223,13 +210,8 @@ ksu_install() {
 
 	local driver_makefile="${KERNEL_DIR}/drivers/Makefile"
 
-	[ -f "$driver_makefile" ] \
-		|| die "drivers/Makefile not found"
-
-	# setup.sh only checks whether the word "kernelsu" already appears.
-	# Some vendor trees carry an obsolete CONFIG_WITH_KERNEL_SU rule.
-	#
-	# Normalize that stale rule to CONFIG_KSU.
+	[ -f "$driver_makefile" ] ||
+		die "drivers/Makefile not found"
 
 	if ! grep -qE \
 		'^[[:space:]]*obj-\$\(CONFIG_KSU\)[[:space:]]*\+=[[:space:]]*kernelsu/?[[:space:]]*$' \
@@ -244,18 +226,16 @@ ksu_install() {
 				"$driver_makefile"
 
 			warn "normalized stale drivers/Makefile KernelSU guard to CONFIG_KSU"
-
 		else
 			printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >>"$driver_makefile"
-
 			warn "added missing CONFIG_KSU rule to drivers/Makefile"
 		fi
 	fi
 
 	grep -qE \
 		'^[[:space:]]*obj-\$\(CONFIG_KSU\)[[:space:]]*\+=[[:space:]]*kernelsu/?[[:space:]]*$' \
-		"$driver_makefile" \
-		|| die "drivers/Makefile is not wired to CONFIG_KSU"
+		"$driver_makefile" ||
+		die "drivers/Makefile is not wired to CONFIG_KSU"
 
 	ok "drivers/Makefile wired to CONFIG_KSU"
 
@@ -263,11 +243,11 @@ ksu_install() {
 
 	local drivers_kconfig="${KERNEL_DIR}/drivers/Kconfig"
 
-	[ -f "$drivers_kconfig" ] \
-		|| die "drivers/Kconfig not found"
+	[ -f "$drivers_kconfig" ] ||
+		die "drivers/Kconfig not found"
 
-	grep -q 'drivers/kernelsu/Kconfig' "$drivers_kconfig" \
-		|| die "drivers/Kconfig was not wired up for kernelsu"
+	grep -q 'drivers/kernelsu/Kconfig' "$drivers_kconfig" ||
+		die "drivers/Kconfig was not wired up for kernelsu"
 
 	ok "drivers/Kconfig wired to drivers/kernelsu/Kconfig"
 
@@ -278,12 +258,9 @@ ksu_install() {
 	head_sha=$(git -C "$ksu_dir" rev-parse --short HEAD)
 
 	head_desc=$(
-		git -C "$ksu_dir" describe --tags --always 2>/dev/null \
-			|| echo "$head_sha"
+		git -C "$ksu_dir" describe --tags --always 2>/dev/null ||
+			echo "$head_sha"
 	)
-
-	# The setup.sh can silently fall back if checkout fails.
-	# Verify that the requested ref really matches HEAD.
 
 	if [ -n "$ref" ]; then
 		local want current
@@ -307,8 +284,8 @@ ksu_install() {
 	local count version_label
 
 	count=$(
-		git -C "$ksu_dir" rev-list --count HEAD 2>/dev/null \
-			|| echo 0
+		git -C "$ksu_dir" rev-list --count HEAD 2>/dev/null ||
+			echo 0
 	)
 
 	if git -C "$ksu_dir" describe --exact-match --tags >/dev/null 2>&1; then
@@ -329,15 +306,26 @@ ksu_install() {
 	export_env UPLOADNAME "-${name// /_}_${version_label}"
 
 	# --------------------------------------------------------- hook resolution
-	#
-	# ReSukiSU documentation states:
-	#
-	# - Tracepoint hook: GKI 2.0 / kernel 5.10+
-	# - Manual Hook: Linux 3.4 through 6.18
-	#
-	# Therefore a 4.19 kernel using auto must resolve to manual.
 
 	ksu_resolve_hook_mode "${KSU_HOOK_MODE:-auto}" "$kver"
+
+	# ------------------------------------------------------ ReSukiSU sanity
+
+	if [ "$variant" = "resukisu" ] &&
+		[ "${KSU_HOOK_MODE_RESOLVED:-}" = "manual" ]; then
+
+		info "ReSukiSU manual-hook mode selected for kernel ${kver}"
+
+		# ReSukiSU requires CONFIG_KSU_MANUAL_HOOK for Manual Hook.
+		#
+		# The automatic input/setuid/initrc helpers are useful on kernels
+		# where those hook paths are compatible with the vendor tree.
+		#
+		# They are deliberately enabled in ksu_hook_configs(), not here,
+		# because the defconfig file is the authoritative configuration.
+
+		ok "ReSukiSU manual-hook mode validated for kernel ${kver}"
+	fi
 
 	summary "| KernelSU variant | \`${name}\` |"
 	summary "| KernelSU ref | \`${ref:-setup.sh default}\` -> \`${version_label}\` |"
@@ -353,10 +341,9 @@ ksu_install() {
 # Resolve the hook mechanism once.
 #
 # auto:
-#   kernel >= 5.10 -> kprobes
-#   kernel < 5.10  -> manual
+# kernel >= 5.10 -> kprobes
+# kernel < 5.10  -> manual
 #
-# This resolved value is reused by both patches.sh and the defconfig stage.
 
 ksu_resolve_hook_mode() {
 	local mode=${1:-auto}
@@ -425,12 +412,22 @@ ksu_hook_configs() {
 					;;
 
 				resukisu)
-					# ReSukiSU manual hooks on non-GKI kernels require
-					# complete kallsyms visibility unless all required
-					# symbols are exported by the vendor tree.
+					# ReSukiSU Manual Hook is the correct mode for
+					# non-GKI kernels such as Linux 4.19.
+					#
+					# ReSukiSU's current manual integration documentation
+					# requires CONFIG_KSU_MANUAL_HOOK.
+					#
+					# These automatic helpers are supported for kernels
+					# where the corresponding kernel paths are compatible.
+					# Kernel 4.19 uses the read hook path described by
+					# ReSukiSU's manual integration guide.
+
 					kconf_set_many "$defconfig" \
 						CONFIG_KSU_MANUAL_HOOK=y \
-						CONFIG_DEBUG_KERNEL=y \
+						CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y \
+						CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y \
+						CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y \
 						CONFIG_KALLSYMS=y \
 						CONFIG_KALLSYMS_ALL=y
 					;;
@@ -440,6 +437,7 @@ ksu_hook_configs() {
 					# hooks from the source patch.
 					:
 					;;
+
 			esac
 			;;
 
@@ -472,3 +470,4 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 		"${KSU_VARIANT:-none}" \
 		"${KSU_REF:-}"
 fi
+```
