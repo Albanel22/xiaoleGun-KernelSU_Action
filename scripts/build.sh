@@ -118,6 +118,7 @@ Available: $(ls "${KERNEL_DIR}/arch/${ARCH}/configs/" | head -20 | tr '\n' ' ')"
 	fi
 
 	info "defconfig changes:"
+
 	diff -u \
 		"${WORKSPACE}/defconfig.orig" \
 		"$DEFCONFIG_PATH" |
@@ -191,110 +192,6 @@ setup_ccache() {
 	fi
 }
 
-# ------------------------------------------------------------- DTC setup ----
-
-# Old Android/vendor kernels are often more reliable with the DTC version
-# shipped in their own source tree than with the host runner's system DTC.
-#
-# The previous build crashed here:
-#
-#   DTC arch/arm64/boot/dts/vendor/qcom/lagoon.dtb
-#   Segmentation fault (core dumped)
-#
-# This function therefore:
-#   1. reports the system DTC;
-#   2. builds the kernel's in-tree DTC when available;
-#   3. prefers that in-tree DTC for the actual kernel build;
-#   4. falls back to the system DTC only when the kernel tree does not carry
-#      its own buildable DTC.
-
-setup_dtc() {
-	group "Preparing Device Tree Compiler"
-
-	local system_dtc
-	system_dtc=$(command -v dtc || true)
-
-	if [ -n "$system_dtc" ]; then
-		info "system dtc: ${system_dtc}"
-
-		if "$system_dtc" --version >/dev/null 2>&1; then
-			"$system_dtc" --version 2>&1 | sed 's/^/    /'
-		else
-			warn "system dtc exists but --version failed"
-		fi
-	else
-		warn "system dtc was not found in PATH"
-	fi
-
-	local kernel_dtc="${OUT}/scripts/dtc/dtc"
-
-	# If the kernel source contains its own DTC, build it explicitly.
-	if [ -f "${KERNEL_DIR}/scripts/dtc/Makefile" ] ||
-		[ -f "${KERNEL_DIR}/scripts/dtc/dtc.c" ]; then
-
-		info "kernel tree contains an in-tree DTC"
-
-		mkdir -p "$OUT"
-
-		local dtc_make_args
-		dtc_make_args="O=out ARCH=${ARCH}"
-
-		if [ -n "${CLANG_PATH:-}" ]; then
-			export PATH="${CLANG_PATH}:${PATH}"
-		fi
-
-		local dtc_cc
-		dtc_cc="${CC:-clang}"
-
-		info "building in-tree DTC with compiler: ${dtc_cc}"
-
-		# shellcheck disable=SC2086
-		if make -j"$(nproc --all)" \
-			CC="$dtc_cc" \
-			$dtc_make_args \
-			scripts/dtc/dtc; then
-
-			if [ -x "$kernel_dtc" ]; then
-				DTC_BIN="$kernel_dtc"
-				export DTC_BIN
-				info "using kernel in-tree DTC: ${DTC_BIN}"
-
-				"$DTC_BIN" --version 2>&1 |
-					sed 's/^/    /' ||
-					true
-
-				export_env DTC_BIN "$DTC_BIN"
-				export_env DTC_VERSION "$("$DTC_BIN" --version 2>/dev/null || echo unknown)"
-
-				ok "in-tree DTC ready"
-				endgroup
-				return 0
-			fi
-
-			warn "in-tree DTC build succeeded but ${kernel_dtc} was not produced"
-		else
-			warn "in-tree DTC could not be built; falling back to system DTC"
-		fi
-	else
-		info "kernel tree has no in-tree DTC source"
-	fi
-
-	if [ -n "$system_dtc" ]; then
-		DTC_BIN="$system_dtc"
-		export DTC_BIN
-		info "using system DTC: ${DTC_BIN}"
-
-		export_env DTC_BIN "$DTC_BIN"
-		export_env DTC_VERSION "$("$DTC_BIN" --version 2>/dev/null || echo unknown)"
-
-		ok "system DTC selected"
-		endgroup
-		return 0
-	fi
-
-	die "no usable Device Tree Compiler (dtc) was found"
-}
-
 build_kernel() {
 	group "Building kernel"
 
@@ -314,68 +211,33 @@ build_kernel() {
 	fi
 
 	setup_ccache
-	setup_dtc
 
 	local args
 	args=$(make_args)
 
 	cd "$KERNEL_DIR"
 
-	local cc
-	cc="${CC:-clang}"
+	# Always keep CC as the compiler itself.
+	local cc="${CC:-clang}"
 
 	info "compiler: ${cc}"
 	info "make arguments: ${args}"
 	info "defconfig: ${KERNEL_CONFIG}"
-	info "DTC: ${DTC_BIN:-system/default}"
 
-	if [ -n "${DTC_BIN:-}" ]; then
-		info "selected DTC version:"
-		"$DTC_BIN" --version 2>&1 |
-			sed 's/^/    /' ||
-			true
-	fi
+	# shellcheck disable=SC2086
+	make -j"$(nproc --all)" \
+		CC="$cc" \
+		$args \
+		"${KERNEL_CONFIG}" ||
+		die "defconfig generation failed"
 
-	# Always keep CC as the compiler itself.
-	#
-	# DTC is explicitly supplied so the old/vendor 4.19 tree does not
-	# accidentally execute an incompatible runner-provided dtc.
-	if [ -n "${DTC_BIN:-}" ]; then
+	info "make ${args}"
 
-		# shellcheck disable=SC2086
-		make -j"$(nproc --all)" \
-			CC="$cc" \
-			DTC="$DTC_BIN" \
-			$args \
-			"${KERNEL_CONFIG}" ||
-			die "defconfig generation failed"
-
-		info "make ${args} DTC=${DTC_BIN}"
-
-		# shellcheck disable=SC2086
-		make -j"$(nproc --all)" \
-			CC="$cc" \
-			DTC="$DTC_BIN" \
-			$args ||
-			die "kernel build failed"
-
-	else
-
-		# shellcheck disable=SC2086
-		make -j"$(nproc --all)" \
-			CC="$cc" \
-			$args \
-			"${KERNEL_CONFIG}" ||
-			die "defconfig generation failed"
-
-		info "make ${args}"
-
-		# shellcheck disable=SC2086
-		make -j"$(nproc --all)" \
-			CC="$cc" \
-			$args ||
-			die "kernel build failed"
-	fi
+	# shellcheck disable=SC2086
+	make -j"$(nproc --all)" \
+		CC="$cc" \
+		$args ||
+		die "kernel build failed"
 
 	if is_true "${ENABLE_CCACHE:-true}" &&
 		command -v ccache >/dev/null 2>&1; then
@@ -392,13 +254,61 @@ check_output() {
 	group "Checking build output"
 
 	local boot="${OUT}/arch/${ARCH}/boot"
-	local image="${boot}/${KERNEL_IMAGE_NAME}"
+	local configured_image="${KERNEL_IMAGE_NAME:-}"
 
-	[ -f "$image" ] || die "expected kernel image not found: ${image}
+	[ -d "$boot" ] ||
+		die "kernel boot output directory not found: ${boot}"
+
+	info "kernel boot directory: ${boot}"
+
+	# First use the configured image name if it exists.
+	local image=""
+
+	if [ -n "$configured_image" ] &&
+		[ -f "${boot}/${configured_image}" ]; then
+		image="${boot}/${configured_image}"
+	else
+		# Some vendor kernels ignore the generic KERNEL_IMAGE_NAME expected
+		# by the workflow and produce a different image. Detect the actual
+		# Kbuild output instead of failing after a successful compilation.
+		local candidate
+
+		for candidate in \
+			Image.gz-dtb \
+			Image.gz \
+			Image \
+			zImage-dtb \
+			zImage \
+			uImage
+		do
+			if [ -f "${boot}/${candidate}" ]; then
+				image="${boot}/${candidate}"
+				break
+			fi
+		done
+	fi
+
+	[ -n "$image" ] || die "no kernel image found in ${boot}
 Built files: $(ls "$boot" 2>/dev/null | tr '\n' ' ')
-Check that KERNEL_IMAGE_NAME matches what your kernel produces."
+Configured KERNEL_IMAGE_NAME: ${configured_image:-<unset>}"
 
-	ok "kernel image: ${KERNEL_IMAGE_NAME} ($(du -h "$image" | cut -f1))"
+	# Publish the image name actually produced by this kernel.
+	# This is important because package.sh runs in a later GitHub Actions
+	# step and therefore needs the resolved value through GITHUB_ENV.
+	local actual_image
+	actual_image=$(basename "$image")
+
+	if [ "$actual_image" != "$configured_image" ]; then
+		warn "configured KERNEL_IMAGE_NAME='${configured_image:-<unset>}' was not produced"
+		warn "detected kernel image '${actual_image}' instead"
+		export_env KERNEL_IMAGE_NAME "$actual_image"
+	else
+		export_env KERNEL_IMAGE_NAME "$configured_image"
+	fi
+
+	ok "kernel image detected: ${actual_image}"
+	ok "kernel image path: ${image}"
+
 	export_env CHECK_FILE_IS_OK true
 
 	if is_true "${NEED_DTBO:-false}"; then
@@ -438,17 +348,21 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 		defconfig)
 			prepare_defconfig
 			;;
+
 		compile)
 			build_kernel
 			;;
+
 		check)
 			check_output
 			;;
+
 		all)
 			prepare_defconfig
 			build_kernel
 			check_output
 			;;
+
 		*)
 			die "unknown build step '$1'"
 			;;
