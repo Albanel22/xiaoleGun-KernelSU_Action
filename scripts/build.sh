@@ -20,11 +20,6 @@ OUT="${KERNEL_DIR}/out"
 
 DEFCONFIG_PATH="${KERNEL_DIR}/arch/${ARCH}/configs/${KERNEL_CONFIG}"
 
-# BUILD_JOBS can be overridden from the workflow.
-# Keep the previous behaviour by default, but allow CI to reduce
-# parallelism when diagnosing DTC/toolchain crashes.
-BUILD_JOBS="${BUILD_JOBS:-$(nproc --all)}"
-
 # ------------------------------------------------------------- defconfig ---
 
 prepare_defconfig() {
@@ -197,83 +192,6 @@ setup_ccache() {
 	fi
 }
 
-# ----------------------------------------------------------- diagnostics ---
-
-show_dtc_info() {
-	info "DTC diagnostics"
-
-	if command -v dtc >/dev/null 2>&1; then
-		info "system dtc: $(command -v dtc)"
-		dtc --version 2>&1 | sed 's/^/    /' || true
-	else
-		warn "system dtc command not found"
-	fi
-
-	if [ -x "${KERNEL_DIR}/scripts/dtc/dtc" ]; then
-		info "kernel dtc: ${KERNEL_DIR}/scripts/dtc/dtc"
-		"${KERNEL_DIR}/scripts/dtc/dtc" --version 2>&1 | sed 's/^/    /' || true
-	else
-		warn "kernel-built scripts/dtc/dtc not found yet"
-	fi
-}
-
-diagnose_dtc_failure() {
-	local status=$1
-
-	[ "$status" -eq 139 ] || return 0
-
-	warn "DTC terminated with SIGSEGV (exit code 139)"
-	warn "The failing target was a Device Tree blob, not KernelSU itself."
-
-	if [ -f "${KERNEL_DIR}/arch/arm64/boot/dts/vendor/qcom/lagoon.dtb" ]; then
-		warn "lagoon.dtb exists despite the failed build; inspect the generated output."
-	fi
-
-	if [ -f "${KERNEL_DIR}/arch/arm64/boot/dts/vendor/qcom/lagoon.dts" ]; then
-		info "lagoon.dts source:"
-		info "    ${KERNEL_DIR}/arch/arm64/boot/dts/vendor/qcom/lagoon.dts"
-	fi
-
-	if [ -d "${KERNEL_DIR}/scripts/dtc" ]; then
-		info "DTC source directory:"
-		info "    ${KERNEL_DIR}/scripts/dtc"
-	fi
-
-	show_dtc_info
-}
-
-# ----------------------------------------------------------- dtb debug ----
-
-build_lagoon_dtb_debug() {
-	local dtb_target="arch/arm64/boot/dts/vendor/qcom/lagoon.dtb"
-
-	info "DTC diagnostic target: ${dtb_target}"
-	info "Running the failing DTB target separately with one job"
-
-	cd "$KERNEL_DIR"
-
-	set +e
-
-	# shellcheck disable=SC2086
-	make -j1 \
-		CC="${CC:-clang}" \
-		$(make_args) \
-		"${dtb_target}"
-
-	local status=$?
-
-	set -e
-
-	if [ "$status" -ne 0 ]; then
-		warn "isolated lagoon.dtb build failed with exit code ${status}"
-		diagnose_dtc_failure "$status"
-	else
-		ok "isolated lagoon.dtb build succeeded"
-	fi
-
-	return "$status"
-}
-
 build_kernel() {
 	group "Building kernel"
 
@@ -303,15 +221,11 @@ build_kernel() {
 	local cc="${CC:-clang}"
 
 	info "compiler: ${cc}"
-	info "make jobs: ${BUILD_JOBS}"
 	info "make arguments: ${args}"
 	info "defconfig: ${KERNEL_CONFIG}"
 
-	show_dtc_info
-
-	# Generate the defconfig.
 	# shellcheck disable=SC2086
-	make -j"${BUILD_JOBS}" \
+	make -j"$(nproc --all)" \
 		CC="$cc" \
 		$args \
 		"${KERNEL_CONFIG}" ||
@@ -319,34 +233,11 @@ build_kernel() {
 
 	info "make ${args}"
 
-	# Build the kernel.
-	#
-	# Keep the original parallel build behaviour, but capture the status
-	# so that a DTC SIGSEGV can be diagnosed before exiting.
-	set +e
-
 	# shellcheck disable=SC2086
-	make -j"${BUILD_JOBS}" \
+	make -j"$(nproc --all)" \
 		CC="$cc" \
-		$args
-
-	local build_status=$?
-
-	set -e
-
-	if [ "$build_status" -ne 0 ]; then
-		diagnose_dtc_failure "$build_status"
-
-		# If the failing target is the known lagoon DTB, provide a
-		# deterministic single-job reproduction in the same runner.
-		if [ "$build_status" -eq 139 ] &&
-			[ -f "${KERNEL_DIR}/arch/arm64/boot/dts/vendor/qcom/lagoon.dts" ]; then
-			warn "reproducing the lagoon DTB failure with BUILD_JOBS=1"
-			build_lagoon_dtb_debug || true
-		fi
-
-		die "kernel build failed (exit code ${build_status})"
-	fi
+		$args ||
+		die "kernel build failed"
 
 	if is_true "${ENABLE_CCACHE:-true}" &&
 		command -v ccache >/dev/null 2>&1; then
@@ -422,7 +313,7 @@ Configured KERNEL_IMAGE_NAME: ${configured_image:-<unset>}"
 
 	if is_true "${NEED_DTBO:-false}"; then
 		[ -f "${boot}/dtbo.img" ] ||
-			die "NEED_DTBO=true but ${boot}/arch/arm64/boot/dtbo.img was not produced"
+			die "NEED_DTBO=true but ${boot}/dtbo.img was not produced"
 
 		export_env CHECK_DTBO_IS_OK true
 		ok "dtbo.img present"
@@ -430,7 +321,7 @@ Configured KERNEL_IMAGE_NAME: ${configured_image:-<unset>}"
 
 	# KPM modifies the final kernel image, so it must run after compilation
 	# and before packaging.
-	if is_true "${ENABLE_KPM:-false]"; then
+	if is_true "${ENABLE_KPM:-false}"; then
 		kpm_patch_image "$image"
 	fi
 
