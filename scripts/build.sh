@@ -35,6 +35,7 @@ Available: $(ls "${KERNEL_DIR}/arch/${ARCH}/configs/" | head -20 | tr '\n' ' ')"
 
 	if [ "${KSU_VARIANT:-none}" != "none" ]; then
 		kconf_enable "$DEFCONFIG_PATH" CONFIG_KSU
+
 		ksu_hook_configs \
 			"${KSU_VARIANT}" \
 			"${KSU_HOOK_MODE:-auto}" \
@@ -190,6 +191,110 @@ setup_ccache() {
 	fi
 }
 
+# ------------------------------------------------------------- DTC setup ----
+
+# Old Android/vendor kernels are often more reliable with the DTC version
+# shipped in their own source tree than with the host runner's system DTC.
+#
+# The previous build crashed here:
+#
+#   DTC arch/arm64/boot/dts/vendor/qcom/lagoon.dtb
+#   Segmentation fault (core dumped)
+#
+# This function therefore:
+#   1. reports the system DTC;
+#   2. builds the kernel's in-tree DTC when available;
+#   3. prefers that in-tree DTC for the actual kernel build;
+#   4. falls back to the system DTC only when the kernel tree does not carry
+#      its own buildable DTC.
+
+setup_dtc() {
+	group "Preparing Device Tree Compiler"
+
+	local system_dtc
+	system_dtc=$(command -v dtc || true)
+
+	if [ -n "$system_dtc" ]; then
+		info "system dtc: ${system_dtc}"
+
+		if "$system_dtc" --version >/dev/null 2>&1; then
+			"$system_dtc" --version 2>&1 | sed 's/^/    /'
+		else
+			warn "system dtc exists but --version failed"
+		fi
+	else
+		warn "system dtc was not found in PATH"
+	fi
+
+	local kernel_dtc="${OUT}/scripts/dtc/dtc"
+
+	# If the kernel source contains its own DTC, build it explicitly.
+	if [ -f "${KERNEL_DIR}/scripts/dtc/Makefile" ] ||
+		[ -f "${KERNEL_DIR}/scripts/dtc/dtc.c" ]; then
+
+		info "kernel tree contains an in-tree DTC"
+
+		mkdir -p "$OUT"
+
+		local dtc_make_args
+		dtc_make_args="O=out ARCH=${ARCH}"
+
+		if [ -n "${CLANG_PATH:-}" ]; then
+			export PATH="${CLANG_PATH}:${PATH}"
+		fi
+
+		local dtc_cc
+		dtc_cc="${CC:-clang}"
+
+		info "building in-tree DTC with compiler: ${dtc_cc}"
+
+		# shellcheck disable=SC2086
+		if make -j"$(nproc --all)" \
+			CC="$dtc_cc" \
+			$dtc_make_args \
+			scripts/dtc/dtc; then
+
+			if [ -x "$kernel_dtc" ]; then
+				DTC_BIN="$kernel_dtc"
+				export DTC_BIN
+				info "using kernel in-tree DTC: ${DTC_BIN}"
+
+				"$DTC_BIN" --version 2>&1 |
+					sed 's/^/    /' ||
+					true
+
+				export_env DTC_BIN "$DTC_BIN"
+				export_env DTC_VERSION "$("$DTC_BIN" --version 2>/dev/null || echo unknown)"
+
+				ok "in-tree DTC ready"
+				endgroup
+				return 0
+			fi
+
+			warn "in-tree DTC build succeeded but ${kernel_dtc} was not produced"
+		else
+			warn "in-tree DTC could not be built; falling back to system DTC"
+		fi
+	else
+		info "kernel tree has no in-tree DTC source"
+	fi
+
+	if [ -n "$system_dtc" ]; then
+		DTC_BIN="$system_dtc"
+		export DTC_BIN
+		info "using system DTC: ${DTC_BIN}"
+
+		export_env DTC_BIN "$DTC_BIN"
+		export_env DTC_VERSION "$("$DTC_BIN" --version 2>/dev/null || echo unknown)"
+
+		ok "system DTC selected"
+		endgroup
+		return 0
+	fi
+
+	die "no usable Device Tree Compiler (dtc) was found"
+}
+
 build_kernel() {
 	group "Building kernel"
 
@@ -209,33 +314,68 @@ build_kernel() {
 	fi
 
 	setup_ccache
+	setup_dtc
 
 	local args
 	args=$(make_args)
 
 	cd "$KERNEL_DIR"
 
-	# Always keep CC as the compiler itself.
-	local cc="${CC:-clang}"
+	local cc
+	cc="${CC:-clang}"
 
 	info "compiler: ${cc}"
 	info "make arguments: ${args}"
 	info "defconfig: ${KERNEL_CONFIG}"
+	info "DTC: ${DTC_BIN:-system/default}"
 
-	# shellcheck disable=SC2086
-	make -j"$(nproc --all)" \
-		CC="$cc" \
-		$args \
-		"${KERNEL_CONFIG}" ||
-		die "defconfig generation failed"
+	if [ -n "${DTC_BIN:-}" ]; then
+		info "selected DTC version:"
+		"$DTC_BIN" --version 2>&1 |
+			sed 's/^/    /' ||
+			true
+	fi
 
-	info "make ${args}"
+	# Always keep CC as the compiler itself.
+	#
+	# DTC is explicitly supplied so the old/vendor 4.19 tree does not
+	# accidentally execute an incompatible runner-provided dtc.
+	if [ -n "${DTC_BIN:-}" ]; then
 
-	# shellcheck disable=SC2086
-	make -j"$(nproc --all)" \
-		CC="$cc" \
-		$args ||
-		die "kernel build failed"
+		# shellcheck disable=SC2086
+		make -j"$(nproc --all)" \
+			CC="$cc" \
+			DTC="$DTC_BIN" \
+			$args \
+			"${KERNEL_CONFIG}" ||
+			die "defconfig generation failed"
+
+		info "make ${args} DTC=${DTC_BIN}"
+
+		# shellcheck disable=SC2086
+		make -j"$(nproc --all)" \
+			CC="$cc" \
+			DTC="$DTC_BIN" \
+			$args ||
+			die "kernel build failed"
+
+	else
+
+		# shellcheck disable=SC2086
+		make -j"$(nproc --all)" \
+			CC="$cc" \
+			$args \
+			"${KERNEL_CONFIG}" ||
+			die "defconfig generation failed"
+
+		info "make ${args}"
+
+		# shellcheck disable=SC2086
+		make -j"$(nproc --all)" \
+			CC="$cc" \
+			$args ||
+			die "kernel build failed"
+	fi
 
 	if is_true "${ENABLE_CCACHE:-true}" &&
 		command -v ccache >/dev/null 2>&1; then
@@ -255,8 +395,8 @@ check_output() {
 	local image="${boot}/${KERNEL_IMAGE_NAME}"
 
 	[ -f "$image" ] || die "expected kernel image not found: ${image}
-   Built files: $(ls "$boot" 2>/dev/null | tr '\n' ' ')
-   Check that KERNEL_IMAGE_NAME matches what your kernel produces."
+Built files: $(ls "$boot" 2>/dev/null | tr '\n' ' ')
+Check that KERNEL_IMAGE_NAME matches what your kernel produces."
 
 	ok "kernel image: ${KERNEL_IMAGE_NAME} ($(du -h "$image" | cut -f1))"
 	export_env CHECK_FILE_IS_OK true
