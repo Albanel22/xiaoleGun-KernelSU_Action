@@ -145,6 +145,21 @@ make_args() {
 		[ -n "${GCC_64:-}" ] ||
 			printf ' CROSS_COMPILE=aarch64-linux-gnu-'
 	fi
+
+	# -----------------------------------------------------------------------
+	# Device Tree Compiler
+	#
+	# The previous builds consistently crashed while generating:
+	#   arch/arm64/boot/dts/vendor/qcom/lagoon.dtb
+	#
+	# Prefer the distro-provided dtc when available. This avoids accidentally
+	# using a stale/corrupted host dtc generated inside the kernel tree.
+	#
+	# The explicit environment variable DTC can still override this choice.
+	# -----------------------------------------------------------------------
+	if [ -z "${DTC:-}" ] && command -v dtc >/dev/null 2>&1; then
+		printf ' DTC=%s' "$(command -v dtc)"
+	fi
 }
 
 setup_ccache() {
@@ -223,6 +238,13 @@ build_kernel() {
 	info "compiler: ${cc}"
 	info "make arguments: ${args}"
 	info "defconfig: ${KERNEL_CONFIG}"
+
+	if command -v dtc >/dev/null 2>&1; then
+		info "device tree compiler: $(command -v dtc)"
+		dtc --version 2>&1 | sed 's/^/    /' || true
+	else
+		warn "system dtc not found; Kbuild will use its default DTC"
+	fi
 
 	# shellcheck disable=SC2086
 	make -j"$(nproc --all)" \
