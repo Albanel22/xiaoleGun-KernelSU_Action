@@ -13,8 +13,34 @@ ARCH=${ARCH:-arm64}
 
 BOOT_OUT="${KERNEL_DIR}/out/arch/${ARCH}/boot"
 AK3="${WORKSPACE}/AnyKernel3"
+DTBO_IMAGE="${WORKSPACE}/dtbo.img"
+ANYKERNEL3_ZIP="${WORKSPACE}/AnyKernel3-${DEVICE:-kiev}-${BUILD_TIME:-unknown}.zip"
 
 # ------------------------------------------------------------- AnyKernel3 ---
+
+# --------------------------------------------------------------- DTBO image ---
+
+prepare_dtbo() {
+	if ! is_true "${NEED_DTBO:-false}"; then
+		return 0
+	fi
+
+	group "Preparing external DTBO image"
+
+	local src="${SOURCE_DTBO_IMAGE:?SOURCE_DTBO_IMAGE required when NEED_DTBO=true}"
+	fetch "$src" "$DTBO_IMAGE"
+
+	[ -s "$DTBO_IMAGE" ] || die "downloaded DTBO image is empty"
+
+	info "DTBO source: ${src}"
+	info "DTBO size: $(du -h "$DTBO_IMAGE" | cut -f1)"
+
+	export_env DTBO_IMAGE_PATH "$DTBO_IMAGE"
+	export_env CHECK_DTBO_IS_OK true
+	ok "external dtbo.img ready"
+
+	endgroup
+}
 
 make_anykernel3() {
 	group "Building AnyKernel3 package"
@@ -105,6 +131,10 @@ PATCH_VBMETA_FLAG=auto;
 
 . tools/ak3-core.sh;
 split_boot;
+if [ -f dtbo.img ]; then
+flash_dtbo;
+fi
+flash_boot;
 EOF
 
 	[ -f "${AK3}/anykernel.sh" ] ||
@@ -126,16 +156,14 @@ EOF
 		die "failed to copy kernel image into AnyKernel3"
 
 	# ---------------------------------------------------------
-	# Optional DTBO
+	# Optional/external DTBO
 	# ---------------------------------------------------------
 
-	if is_true "${CHECK_DTBO_IS_OK:-false}"; then
-		[ -f "${BOOT_OUT}/dtbo.img" ] ||
-			die "CHECK_DTBO_IS_OK=true but ${BOOT_OUT}/dtbo.img is missing"
+	if is_true "${NEED_DTBO:-false}"; then
+		[ -f "$DTBO_IMAGE" ] ||
+			die "DTBO image missing at ${DTBO_IMAGE}"
 
-		cp \
-			"${BOOT_OUT}/dtbo.img" \
-			"${AK3}/" ||
+		cp "$DTBO_IMAGE" "${AK3}/dtbo.img" ||
 			die "failed to copy dtbo.img into AnyKernel3"
 	fi
 
@@ -148,7 +176,21 @@ EOF
 		"${AK3}/.github" \
 		"${AK3}/README.md"
 
+	# Produce the actual flashable ZIP here, not only a directory artifact.
+	# Keep LICENSE in the package as required by AnyKernel3.
+	rm -f "$ANYKERNEL3_ZIP"
+	(
+		cd "$AK3"
+		zip -qr9 "$ANYKERNEL3_ZIP" . \
+			-x '.git/*' '.github/*' 'README.md' '*.zip'
+	) || die "failed to create ${ANYKERNEL3_ZIP}"
+
+	[ -s "$ANYKERNEL3_ZIP" ] || die "AnyKernel3 ZIP is empty"
+
+	export_env ANYKERNEL3_ZIP "$ANYKERNEL3_ZIP"
+
 	ok "AnyKernel3 package assembled"
+	ok "AnyKernel3 ZIP: ${ANYKERNEL3_ZIP}"
 	ok "AnyKernel3 target: kiev / XT2113-2"
 	ok "AnyKernel3 BLOCK: /dev/block/by-name/boot"
 	ok "AnyKernel3 slot device: 1"
@@ -276,8 +318,9 @@ write_summary() {
 
 	for f in \
 		"${BOOT_OUT}/${KERNEL_IMAGE_NAME}" \
-		"${BOOT_OUT}/dtbo.img" \
-		"${WORKSPACE}/boot.img"
+		"${DTBO_IMAGE}" \
+		"${WORKSPACE}/boot.img" \
+		"${ANYKERNEL3_ZIP}"
 	do
 		if [ -f "$f" ]; then
 			summary "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) |"
@@ -296,6 +339,7 @@ write_summary() {
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 	case "${1:-all}" in
 		anykernel3)
+			prepare_dtbo
 			make_anykernel3
 			;;
 
@@ -304,6 +348,7 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 			;;
 
 		all)
+			prepare_dtbo
 			make_anykernel3
 			make_boot_image
 			write_summary

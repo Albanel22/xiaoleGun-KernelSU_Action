@@ -1,4 +1,3 @@
-```bash
 #!/usr/bin/env bash
 
 # Install a KernelSU variant into the kernel tree.
@@ -470,4 +469,3 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 		"${KSU_VARIANT:-none}" \
 		"${KSU_REF:-}"
 fi
-```

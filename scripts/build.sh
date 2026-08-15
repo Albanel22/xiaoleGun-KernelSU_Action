@@ -334,11 +334,11 @@ Configured KERNEL_IMAGE_NAME: ${configured_image:-<unset>}"
 	export_env CHECK_FILE_IS_OK true
 
 	if is_true "${NEED_DTBO:-false}"; then
-		[ -f "${boot}/dtbo.img" ] ||
-			die "NEED_DTBO=true but ${boot}/dtbo.img was not produced"
-
-		export_env CHECK_DTBO_IS_OK true
-		ok "dtbo.img present"
+		if [ -f "${boot}/dtbo.img" ]; then
+			ok "kernel tree also produced dtbo.img"
+		else
+			info "external DTBO configured; no kernel-built dtbo.img is required"
+		fi
 	fi
 
 	# KPM modifies the final kernel image, so it must run after compilation
