@@ -81,6 +81,11 @@
 
 `ENABLE_PATH_UMOUNT=true` 即可，代码直接取自上游，插入到 `fs/namespace.c` 中 `do_umount()` 之后。在 5.9+ 的内核上会自动跳过；已经有该函数时也会跳过。
 
+
+## 需要独立 DTBO 的设备
+
+如果设备需要单独刷写 DTBO，请设置 `NEED_DTBO=true` 并填写 `SOURCE_DTBO_IMAGE` 直链。打包阶段会下载 DTBO、放入 AnyKernel3 ZIP，并调用 AnyKernel3 的 `flash_dtbo` 后再刷写 boot。Motorola kiev 配置已指向与 boot.img 同为 2026-08-09 的 LineageOS DTBO。
+
 ## 其它补丁
 
 | 选项 | 作用 |
