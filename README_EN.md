@@ -25,7 +25,7 @@ If you are not the kernel author, please keep KernelSU builds made from someone 
 2. Edit [`config.env`](config.env) — at minimum `KERNEL_SOURCE`, `KERNEL_SOURCE_BRANCH`, `KERNEL_CONFIG` and `KERNEL_IMAGE_NAME`.
 3. Go to `Actions` → `Build Kernel` → `Run workflow`.
 4. Pick your KernelSU variant, whether to enable SUSFS, and so on, then run it.
-5. Download the AnyKernel3 artifact and flash it from a custom recovery.
+5. Download the generated AnyKernel3 flashable ZIP and flash it from a compatible custom recovery.
 
 The dropdowns all default to `config`, meaning "use whatever the config file says". They **override** the matching key in `config.env` only when you actively change them, so day-to-day tweaking needs no commits — and simply hitting Run always builds exactly what your profile describes, rather than silently switching off a feature you enabled because some checkbox defaulted to off.
 
@@ -84,6 +84,11 @@ The set of `CONFIG_KSU_SUSFS_*` options is read out of the Kconfig that was actu
 `path_umount()` only arrived in Linux 5.9. KernelSU uses it to unmount its own mounts before an app checks for root, so older kernels need it backported or module unmounting silently does nothing.
 
 Set `ENABLE_PATH_UMOUNT=true`. The code is upstream's, inserted into `fs/namespace.c` after `do_umount()`. It is skipped automatically on 5.9+ and on trees that already have the function.
+
+
+## DTBO for devices that require a separate image
+
+Set `NEED_DTBO=true` and `SOURCE_DTBO_IMAGE` to a direct DTBO image URL. The package step downloads that image, places it in the AnyKernel3 ZIP, and calls AnyKernel3's `flash_dtbo` method before `flash_boot`. For the Motorola kiev profile, the configured source is the LineageOS 2026-08-09 DTBO matching the configured 2026-08-09 boot source.
 
 ## Other patches
 
