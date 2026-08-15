@@ -307,12 +307,15 @@ jobs:
       # CCACHE
       # ---------------------------------------------------------------
 
-      - name: Set up ccache
+      - name: Restore ccache
         if: env.ENABLE_CCACHE == 'true'
-        uses: hendrikmuhs/ccache-action@v1.2
+        uses: actions/cache@v4
         with:
-          key: kernel-${{ env.DEVICE }}-${{ env.KSU_VARIANT }}-${{ env.KERNEL_VERSION }}
-          max-size: 2G
+          path: ${{ env.WORKSPACE }}/.ccache
+          key: ccache-${{ runner.os }}-${{ env.DEVICE }}-${{ env.KERNEL_VERSION }}-${{ env.KSU_VARIANT }}-${{ env.KSU_REF_RESOLVED }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ env.DEVICE }}-${{ env.KERNEL_VERSION }}-${{ env.KSU_VARIANT }}-
+            ccache-${{ runner.os }}-${{ env.DEVICE }}-${{ env.KERNEL_VERSION }}-
 
       - name: Show build environment
         run: |
@@ -392,20 +395,20 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
-      - name: Upload AnyKernel3
+      - name: Upload AnyKernel3 ZIP
         uses: actions/upload-artifact@v4
         with:
           name: AnyKernel3${{ env.LOCALVERSION }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
-          path: ${{ env.WORKSPACE }}/AnyKernel3/**
+          path: ${{ env.ANYKERNEL3_ZIP }}
           if-no-files-found: error
           compression-level: 0
 
       - name: Upload DTBO image
-        if: env.CHECK_DTBO_IS_OK == 'true'
+        if: env.NEED_DTBO == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: dtbo-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
-          path: ${{ env.WORKSPACE }}/android-kernel/out/arch/${{ env.ARCH }}/boot/dtbo.img
+          path: ${{ env.DTBO_IMAGE_PATH }}
           if-no-files-found: error
           compression-level: 0
 
@@ -478,33 +481,18 @@ jobs:
           echo "Downloaded artifacts:"
           find artifacts -maxdepth 3 -type f -print | sort
 
-      - name: Package AnyKernel3 as flashable zip
+      - name: Collect AnyKernel3 flashable ZIP
         run: |
           set -euo pipefail
-
           shopt -s nullglob
-
-          found=false
-
-          for dir in artifacts/AnyKernel3*/; do
-            found=true
-
-            name="$(basename "${dir%/}")"
-
-            (
-              cd "$dir"
-              zip -qr9 \
-                "${GITHUB_WORKSPACE}/release/${name}.zip" \
-                .
-            )
-
-            echo "Packed ${name}.zip"
-          done
-
-          if [ "$found" = false ]; then
-            echo "::error::No AnyKernel3 artifact was downloaded."
+          files=(artifacts/AnyKernel3*/*.zip artifacts/AnyKernel3*.zip)
+          [ "${#files[@]}" -gt 0 ] || {
+            echo "::error::No AnyKernel3 ZIP artifact was downloaded."
             exit 1
-          fi
+          }
+          for f in "${files[@]}"; do
+            cp "$f" release/
+          done
 
       - name: Collect kernel artifacts
         run: |
